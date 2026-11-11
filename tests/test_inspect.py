@@ -107,6 +107,7 @@ def test_names():
     assert ollama_name("Qwen2.5-0.5B-Instruct", "Q4_K_M") == "qwen2.5-0.5b-instruct:q4_k_m"
     assert ollama_name("Tiny Test Model", "Q8_0") == "tiny-test-model:q8_0"
     assert ollama_name("model-F16", "Q4_K_M") == "model:q4_k_m"
+    assert ollama_name("Qwen3-8B-Instruct-日本語版-2026年11月版", "Q6_K") == "qwen3-8b-instruct-2026-11:q6_k"
     assert output_filename("Qwen3-8B", "Q4_K_M") == "Qwen3-8B-Q4_K_M.gguf"
     assert output_filename("Qwen3-8B-F16", "Q4_K_M") == "Qwen3-8B-Q4_K_M.gguf"
     assert output_filename("a/b:c", "Q8_0") == "a-b-c-Q8_0.gguf"
@@ -118,3 +119,12 @@ def test_supported_arch_scan_has_common_models():
         return
     for a in ("LlamaForCausalLM", "Qwen2ForCausalLM", "MistralForCausalLM", "Gemma2ForCausalLM"):
         assert a in archs
+
+
+def test_gguf_stem_drops_type_and_split(jp_dir: Path):
+    b = inspect_base(write_gguf(jp_dir / "gemma-4-26B-A4B-it-Q5_K_M.gguf", ftype="Q5_K_M", main_type="Q5_K"))
+    assert b.name == "Tiny Test Model" and b.stem == "gemma-4-26B-A4B-it"
+    assert output_filename(b.stem, "Q4_K_M") == "gemma-4-26B-A4B-it-Q4_K_M.gguf"
+    assert ollama_name(b.stem, "Q4_K_M") == "gemma-4-26b-a4b-it:q4_k_m"
+    s = inspect_base(write_gguf(jp_dir / "big-model-f16-00001-of-00001.gguf"))
+    assert s.stem == "big-model"

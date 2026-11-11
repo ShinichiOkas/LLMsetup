@@ -45,10 +45,10 @@ class JobSpec:
     threads: int | None = None
 
     def output_path(self, qtype: str) -> Path:
-        return Path(self.out_dir) / output_filename(self.base.name, qtype)
+        return Path(self.out_dir) / output_filename(self.base.stem, qtype)
 
     def ollama_name_for(self, qtype: str) -> str:
-        return self.ollama_names.get(qtype) or ollama_name(self.base.name, qtype)
+        return self.ollama_names.get(qtype) or ollama_name(self.base.stem, qtype)
 
 
 @dataclass
@@ -147,7 +147,7 @@ def plan(spec: JobSpec) -> list[Step]:
                 partial=_part(final), final=final, weight=2.0 * gb,
             ))
         if via_inter:
-            inter_name = output_filename(base.name, inter_t)
+            inter_name = output_filename(base.stem, inter_t)
             created_inter = False
             if inter_t in targets:
                 inter = spec.output_path(inter_t)  # already produced above
@@ -257,6 +257,7 @@ def _ollama_create(gguf: Path, name: str, t: str) -> Callable[["Runner"], None]:
 
 # ---------------------------------------------------------------- runner
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 _QUANT_PROGRESS = re.compile(r"^\[\s*(\d+)\s*/\s*(\d+)\]")
 _PERCENT = re.compile(r"(\d{1,3})%\|")
 
@@ -310,7 +311,10 @@ class Runner:
         return self._cancel.is_set()
 
     def log(self, line: str) -> None:
-        self.on_log(line)
+        # ollama prints terminal control sequences (ESC[K, ESC[2K ...)
+        line = _ANSI_RE.sub("", line)
+        if line.strip():
+            self.on_log(line)
 
     def run(self) -> JobResult:
         t0 = time.monotonic()

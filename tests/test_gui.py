@@ -53,7 +53,7 @@ def test_gui_existing_output_blocks_run(app, jp_dir: Path):
     w.ollama_chk.setChecked(False)
     w.load_base(str(g))
     w.set_selected(["Q4_K_M"])
-    out = jp_dir / "Tiny Test Model-Q4_K_M.gguf"
+    out = jp_dir / "m-Q4_K_M.gguf"
     out.write_bytes(b"x")
     w._update_plan()
     assert not w.run_btn.isEnabled() and "同名" in w.status.text()
@@ -69,7 +69,7 @@ def test_gui_ollama_names(app, jp_dir: Path):
     w.ollama_chk.setChecked(True)
     w.load_base(str(g))
     w.set_selected(["Q4_K_M", "Q8_0"])
-    assert sorted(w.ollama_preview.text().splitlines()) == ["tiny-test-model:q4_k_m", "tiny-test-model:q8_0"]
+    assert sorted(w.ollama_preview.text().splitlines()) == ["m:q4_k_m", "m:q8_0"]
     w.ollama_edit.setText("mymodel")
     w._on_ollama_edited("mymodel")
     assert sorted(w.ollama_preview.text().splitlines()) == ["mymodel:q4_k_m", "mymodel:q8_0"]

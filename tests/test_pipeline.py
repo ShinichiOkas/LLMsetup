@@ -52,7 +52,7 @@ def test_plan_gguf_requant(jp_dir: Path):
 
 def test_check_outputs(jp_dir: Path):
     b = inspect_base(write_gguf(jp_dir / "m-F16.gguf"))
-    existing = jp_dir / "Tiny Test Model-Q4_K_M.gguf"
+    existing = jp_dir / "m-Q4_K_M.gguf"
     existing.write_bytes(b"x")
     errs = check_outputs(JobSpec(b, ["Q4_K_M"], out_dir=jp_dir))
     assert any("同名" in e for e in errs)
@@ -62,6 +62,14 @@ def test_check_outputs(jp_dir: Path):
                                  ollama_names={"Q4_K_M": "Bad Name!"}))
     assert any("Ollama" in e for e in errs)
     assert any("1 つ以上" in e for e in check_outputs(JobSpec(b, [], out_dir=jp_dir)))
+
+
+def test_log_strips_ansi():
+    got = []
+    r = Runner([], on_log=got.append)
+    r.log("parsing GGUF \x1b[K")
+    r.log("\x1b[1G\x1b[K\x1b[2K\x1b[1G")
+    assert got == ["parsing GGUF "]
 
 
 def test_parse_progress():

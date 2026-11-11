@@ -48,6 +48,11 @@ class BaseInfo:
     problems: list[str] = field(default_factory=list)  # fatal: no options possible
     warnings: list[str] = field(default_factory=list)
     details: dict[str, str] = field(default_factory=dict)
+    file_stem: str = ""  # base for output file / Ollama names (file or folder name)
+
+    @property
+    def stem(self) -> str:
+        return self.file_stem or self.name
 
     @property
     def ok(self) -> bool:
@@ -148,7 +153,7 @@ def _sub(cfg: dict) -> dict:
 
 
 def _inspect_hf(model_dir: Path, picked: Path) -> BaseInfo:
-    info = BaseInfo(path=picked, kind=KIND_HF, model_dir=model_dir, name=model_dir.name)
+    info = BaseInfo(path=picked, kind=KIND_HF, model_dir=model_dir, name=model_dir.name, file_stem=model_dir.name)
     try:
         cfg = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
@@ -189,7 +194,7 @@ def _inspect_hf(model_dir: Path, picked: Path) -> BaseInfo:
             n, n1, nbytes, dtypes = _count_safetensors(files)
             info.n_params, info.n_params_1d, info.weight_bytes = n, n1, nbytes
             if dtypes:
-                main = max(dtypes, key=dtypes.get)
+                main = max(dtypes, key=lambda k: dtypes[k])
                 info.source_type = {"F16": "F16", "BF16": "BF16", "F32": "F32"}.get(main, main)
                 if main.startswith("F8") or main in ("I8", "U8", "I32", "F4"):
                     info.warnings.append(f"重みが {main} で保存されています（事前量子化済みの HF モデル）。変換器が展開できない場合があります")
@@ -236,7 +241,8 @@ def _inspect_hf(model_dir: Path, picked: Path) -> BaseInfo:
 # ---------------------------------------------------------------- GGUF
 
 def _inspect_gguf(path: Path) -> BaseInfo:
-    info = BaseInfo(path=path, kind=KIND_GGUF, name=path.stem)
+    stem = SPLIT_STEM_RE.sub("", path.stem)
+    info = BaseInfo(path=path, kind=KIND_GGUF, name=stem, file_stem=strip_type_suffix(stem))
     try:
         hdr, parts = read_all_parts(path)
     except (OSError, GGUFError) as e:
@@ -263,7 +269,7 @@ def _inspect_gguf(path: Path) -> BaseInfo:
 
     hist = hdr.type_histogram()
     big = {k: v for k, v in hist.items() if k not in ("F32",)} or hist
-    main_tensor_type = max(big, key=big.get) if big else None
+    main_tensor_type = max(big, key=lambda k: big[k]) if big else None
     ft = hdr.file_type_name
     if ft and ft != "GUESSED":
         info.source_type = ft
@@ -343,19 +349,25 @@ def inspect_base(path: str | Path) -> BaseInfo:
 
 
 _SANITIZE_RE = re.compile(r"[^a-z0-9._-]+")
+SPLIT_STEM_RE = re.compile(r"-\d{5}-of-\d{5}$", re.IGNORECASE)
+_TYPE_SUFFIX_RE = re.compile(r"[-_.](f32|f16|bf16|q\d\w*|iq\d\w*|tq\d\w*|mxfp4\w*)$", re.IGNORECASE)
+
+
+def strip_type_suffix(stem: str) -> str:
+    """``gemma-4-it-Q5_K_M`` -> ``gemma-4-it`` (the type is re-added for outputs)."""
+    return _TYPE_SUFFIX_RE.sub("", stem) or stem
 
 
 def ollama_name(base_name: str, qtype: str) -> str:
     """Ollama model name ``<name>:<tag>`` built from the base name and type."""
-    stem = _SANITIZE_RE.sub("-", base_name.lower()).strip("-.") or "model"
-    stem = re.sub(r"-(f16|bf16|f32|q\d[\w]*|iq\d[\w]*)$", "", stem) or stem
-    return f"{stem[:60]}:{qtype.lower()}"
+    stem = _SANITIZE_RE.sub("-", strip_type_suffix(base_name).lower())
+    stem = re.sub(r"-{2,}", "-", stem).strip("-.") or "model"
+    return f"{stem[:60].rstrip('-.')}:{qtype.lower()}"
 
 
 def output_filename(base_name: str, qtype: str) -> str:
     stem = re.sub(r'[\\/:*?"<>|]+', "-", base_name).strip() or "model"
-    stem = re.sub(r"[-_.](f16|bf16|f32|F16|BF16|F32)$", "", stem)
-    return f"{stem}-{qtype}.gguf"
+    return f"{strip_type_suffix(stem)}-{qtype}.gguf"
 
 
 __all__ = [

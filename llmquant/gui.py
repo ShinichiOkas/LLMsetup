@@ -346,7 +346,7 @@ class MainWindow(QMainWindow):
             self.out_edit.setText(str(p.parent if p.is_file() else p.parent))
             self._out_dir_auto = True
         if self._ollama_stem_auto or not self.ollama_edit.text().strip():
-            self.ollama_edit.setText(ollama_name(base.name, "x").split(":")[0])
+            self.ollama_edit.setText(ollama_name(base.stem, "x").split(":")[0])
             self._ollama_stem_auto = True
         self._rebuild_options()
 
@@ -508,7 +508,7 @@ class MainWindow(QMainWindow):
         if self.base is None:
             return None
         sel = self.selected_types()
-        stem = self.ollama_edit.text().strip().lower() or ollama_name(self.base.name, "x").split(":")[0]
+        stem = self.ollama_edit.text().strip().lower() or ollama_name(self.base.stem, "x").split(":")[0]
         return JobSpec(
             base=self.base, targets=sel, out_dir=Path(self.out_edit.text().strip() or "."),
             imatrix=self._imatrix(), keep_intermediate=self.keep_inter_chk.isChecked(),
@@ -523,7 +523,7 @@ class MainWindow(QMainWindow):
             self.run_btn.setEnabled(False)
             return
         sel = spec.targets
-        self.files_label.setText("\n".join(output_filename(spec.base.name, t) for t in sel) or "-")
+        self.files_label.setText("\n".join(output_filename(spec.base.stem, t) for t in sel) or "-")
         self.ollama_edit.setEnabled(spec.register_ollama)
         self.ollama_preview.setText(
             ("\n".join(spec.ollama_name_for(t) for t in sel) or "-") if spec.register_ollama else "（登録しない）")
@@ -644,13 +644,23 @@ def run_gui(path: str | None = None, screenshot: str | None = None, width: int =
         # Render without putting a window on the user's screen.
         w.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
         w.show()
+        ok = [False]
 
         def shoot() -> None:
-            w.grab().save(screenshot)
+            ok[0] = w.grab().save(screenshot)
+            w.close()
             app.quit()
 
         QTimer.singleShot(400, shoot)
         app.exec()
-        return 0
-    w.show()
-    return app.exec()
+        rc = 0 if ok[0] else 1
+    else:
+        w.show()
+        rc = app.exec()
+    # Destroy the window before QApplication goes away; letting the
+    # interpreter tear both down in arbitrary order crashes (0xC0000005).
+    w._size_gen += 1  # stop background dry-run threads from emitting
+    w.deleteLater()
+    QApplication.processEvents()
+    del w
+    return rc
