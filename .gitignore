@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# downloaded llama.cpp binaries (install.bat fetches the pinned release)
+vendor/llama-bin/
+
+# model files never go into git
+*.gguf
+*.gguf.part
+*.safetensors
+*.Modelfile
+/models/
+/out/
