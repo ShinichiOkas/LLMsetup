@@ -20,7 +20,8 @@ from typing import Callable
 from . import catalog, tools
 from .basemodel import KIND_GGUF, KIND_HF, BaseInfo, ollama_name, output_filename
 from .gguf_reader import read_header
-from .options import intermediate_type
+from .basemodel import human_bytes
+from .options import Environment, build_options, intermediate_type
 
 
 class JobError(RuntimeError):
@@ -108,7 +109,52 @@ def check_outputs(spec: JobSpec) -> list[str]:
                 errs.append("出力先が元のファイルと同じです")
         except OSError:
             pass
+
+    # The same rules the GUI shows: a disabled type never reaches the tools,
+    # whichever entrance (GUI, CLI, API) asked for it.
+    if spec.base.ok and spec.targets:
+        env = Environment.detect(Path(spec.out_dir), Path(spec.work_dir) if spec.work_dir else None)
+        by = {o.name: o for o in build_options(spec.base, env, spec.imatrix)}
+        for t in spec.targets:
+            o = by.get(t.upper())
+            if o is None:
+                errs.append(f"{t} は扱えない種類です")
+            elif not o.enabled:
+                errs.append(f"{t} は作れません: {' / '.join(o.reasons)}")
+        if spec.register_ollama:
+            need = sum(by[t.upper()].est_bytes for t in spec.targets if t.upper() in by)
+            odir = tools.ollama_models_dir()
+            free = tools.free_bytes(odir)
+            same = Path(odir).resolve().drive.lower() == Path(spec.out_dir).resolve().drive.lower()
+            if free is not None and need * (2 if same else 1) > free:
+                errs.append(f"Ollama の保存先（{odir}）の空きが足りません。登録で GGUF がもう 1 つ複製されます"
+                            f"（必要 約 {human_bytes(need * (2 if same else 1))} / 空き {human_bytes(free)}）")
+
+    # ollama create silently replaces a model of the same name.
+    if names and not spec.overwrite:
+        existing = tools.ollama_model_names()
+        if existing:
+            dup = [n for n in names if n.lower() in existing or f"{n.lower()}:latest" in existing]
+            if dup:
+                errs.append(f"Ollama に同名のモデルがあります: {', '.join(dup)}（置き換えるなら「上書き」に印）")
     return errs
+
+
+def template_is_bare(show_modelfile: str) -> bool:
+    """True when Ollama did not recognise a chat template.
+
+    Real ``ollama show --modelfile`` output (0.40): a recognised template is
+    ``TEMPLATE "<multi-line>"``; an unrecognised or missing one is the bare
+    passthrough ``TEMPLATE {{ .Prompt }}``. A RENDERER line means Ollama renders
+    the conversation itself.
+    """
+    if re.search(r"^RENDERER\s+\S", show_modelfile, re.MULTILINE):
+        return False
+    m = re.search(r'^TEMPLATE\s+(?:"((?:[^"\\]|\\.)*)"|(.*))$', show_modelfile, re.MULTILINE | re.DOTALL)
+    if not m:
+        return True
+    body = (m.group(1) if m.group(1) is not None else (m.group(2) or "").splitlines()[0]).strip()
+    return body in ("", "{{ .Prompt }}")
 
 
 def plan(spec: JobSpec) -> list[Step]:
@@ -242,10 +288,9 @@ def _ollama_create(gguf: Path, name: str, t: str) -> Callable[["Runner"], None]:
         mf.write_text(_modelfile_text(gguf), encoding="utf-8")
         r.log(f"Modelfile: {mf}")
         r.run_cmd([str(exe), "create", name, "-f", str(mf)], cwd=gguf.parent)
+        tools.forget_ollama_cache()
         show = r.capture([str(exe), "show", name, "--modelfile"])
-        tmpl = re.search(r'^TEMPLATE\s+(.*?)(?=^\w+\s|\Z)', show, re.MULTILINE | re.DOTALL)
-        body = tmpl.group(1).strip().strip('"').strip() if tmpl else ""
-        if not body or body in ("{{ .Prompt }}", '"{{ .Prompt }}"'):
+        if template_is_bare(show):
             w = (f"{name}: Ollama がチャットテンプレートを認識しませんでした（TEMPLATE が素通し）。"
                  "会話で使うなら Modelfile に TEMPLATE を書き足してください")
             r.log("WARN: " + w)

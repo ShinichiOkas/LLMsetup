@@ -55,7 +55,54 @@ def ollama_exe() -> Path | None:
 
 
 def python_exe() -> Path:
-    return Path(sys.executable)
+    """Interpreter for the converter: the venv's python.exe even when the GUI
+    itself runs under pythonw.exe (run.bat)."""
+    exe = Path(sys.executable)
+    if exe.name.lower() == "pythonw.exe":
+        console = exe.with_name("python.exe")
+        if console.is_file():
+            return console
+    return exe
+
+
+def ollama_models_dir() -> Path:
+    env = os.environ.get("OLLAMA_MODELS")
+    return Path(env) if env else Path.home() / ".ollama" / "models"
+
+
+_ollama_cache: tuple[float, set[str] | None] = (0.0, None)
+
+
+def ollama_model_names(max_age: float = 5.0) -> set[str] | None:
+    """Names (``name:tag``) registered in Ollama, or None if it cannot be asked."""
+    global _ollama_cache
+    import time
+
+    now = time.monotonic()
+    if _ollama_cache[1] is not None and now - _ollama_cache[0] < max_age:
+        return _ollama_cache[1]
+    exe = ollama_exe()
+    if exe is None:
+        return None
+    try:
+        p = subprocess.run([str(exe), "list"], capture_output=True, timeout=15, creationflags=CREATE_NO_WINDOW,
+                           stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if p.returncode != 0:
+        return None
+    names = set()
+    for line in p.stdout.decode("utf-8", errors="replace").splitlines()[1:]:
+        parts = line.split()
+        if parts:
+            names.add(parts[0].lower())
+    _ollama_cache = (now, names)
+    return names
+
+
+def forget_ollama_cache() -> None:
+    global _ollama_cache
+    _ollama_cache = (0.0, None)
 
 
 _REGISTER_RE = re.compile(r"@ModelBase\.register\((.*?)\)", re.DOTALL)

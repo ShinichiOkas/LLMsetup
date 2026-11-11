@@ -178,7 +178,7 @@ class MainWindow(QMainWindow):
         self.files_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         f3.addRow("できるファイル:", self.files_label)
         chk_row = QHBoxLayout()
-        self.overwrite_chk = QCheckBox("同名のファイルを上書きする")
+        self.overwrite_chk = QCheckBox("同名のファイル・Ollama モデルを上書きする")
         self.overwrite_chk.toggled.connect(self._update_plan)
         self.keep_inter_chk = QCheckBox("中間ファイル（F16/BF16）を残す")
         self.keep_inter_chk.toggled.connect(self._update_plan)

@@ -39,7 +39,16 @@ from llmquant import tools  # noqa: E402
 from llmquant.basemodel import inspect_base  # noqa: E402
 from llmquant.gguf_reader import read_header  # noqa: E402
 from llmquant.options import Environment, build_options  # noqa: E402
-from llmquant.pipeline import Cancelled, JobSpec, Runner, check_outputs, dry_run_size, plan, run_job  # noqa: E402
+from llmquant.pipeline import (  # noqa: E402
+    Cancelled,
+    JobSpec,
+    Runner,
+    check_outputs,
+    dry_run_size,
+    plan,
+    run_job,
+    template_is_bare,
+)
 
 MODEL_REPO = "HuggingFaceTB/SmolLM2-135M-Instruct"
 results: list[tuple[str, bool, str]] = []
@@ -150,14 +159,18 @@ def main() -> int:
         spec = JobSpec(gb, ["Q4_K_S"], out_dir=out_dir)
         r = run_job(spec)
         got = r.outputs.get("Q4_K_S")
-        real = got.stat().st_size if got else None
-        close = bool(exact and real and abs(exact - real) / real < 0.02)
+        # dry-run reports tensor bytes only; compare with the header, not the file
+        # size (tokenizer metadata is a large share of a ~100 MB file)
+        real = read_header(got).tensor_bytes if got else None
+        close = bool(exact and real and abs(exact - real) / real < 0.01)
         stage("5 requant", gb.is_quantized and gopts["Q8_0"].status == "disabled" and got is not None and close,
               f"dry-run={exact} real={real} need_imatrix={need_im}")
 
-        # 6 imatrix-only type is refused up front
+        # 6 imatrix-only type is refused up front, by the options AND by the job gate
         o = {x.name: x for x in build_options(base, Environment.detect(out_dir))}["IQ2_XXS"]
-        stage("6 imatrix", o.status == "disabled" and any("imatrix" in x for x in o.reasons), "; ".join(o.reasons))
+        gate = check_outputs(JobSpec(base, ["IQ2_XXS"], out_dir=out_dir))
+        stage("6 imatrix", o.status == "disabled" and any("IQ2_XXS は作れません" in e for e in gate),
+              "; ".join(o.reasons) + " | gate: " + "; ".join(gate))
 
         # 7 cancel mid-run
         cdir = work / "取り消し 先"
@@ -182,7 +195,7 @@ def main() -> int:
         for name in created_models:
             answers[name] = ask(name)[:120]
             show = ollama("show", name, "--modelfile").stdout.decode("utf-8", errors="replace")
-            if "TEMPLATE" not in show or 'TEMPLATE """{{ .Prompt }}"""' in show or "TEMPLATE {{ .Prompt }}" in show:
+            if template_is_bare(show):
                 bare.append(name)
         ok = bool(answers) and all(len(v) > 0 for v in answers.values()) and not bare
         stage("8 ollama", ok, json.dumps({"answers": answers, "bare_template": bare}, ensure_ascii=False))

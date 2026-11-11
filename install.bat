@@ -47,7 +47,8 @@ rem silently leave the converter missing.
 echo [4/8] Fetching submodules (llama.cpp, pinned)...
 git submodule sync --recursive
 if errorlevel 1 goto submodule_failed
-git submodule update --init --recursive --depth 1
+rem core.longpaths: llama.cpp has paths beyond MAX_PATH when cloned into a deep folder.
+git -c core.longpaths=true submodule update --init --recursive --depth 1
 if errorlevel 1 goto submodule_failed
 if not exist "vendor\llama.cpp\convert_hf_to_gguf.py" goto submodule_empty
 if not exist "vendor\llama.cpp\gguf-py\pyproject.toml" goto submodule_empty
