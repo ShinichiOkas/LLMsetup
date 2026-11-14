@@ -15,6 +15,134 @@ from . import tools
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._\-/]*(:[a-z0-9._\-]+)?$")
 
 
+@dataclass(frozen=True)
+class ParamMeta:
+    key: str
+    name: str
+    default: str
+    min_val: float | int | None
+    max_val: float | int | None
+    step: float | int | None
+    val_type: str  # "float" | "int" | "string"
+    unit: str = ""
+    description: str = ""
+
+    def range_text(self) -> str:
+        """Returns human readable range string, e.g. '0.0 〜 2.0' or '512 〜 32,768 tokens'."""
+        if self.min_val is not None and self.max_val is not None:
+            if self.val_type == "int":
+                min_s = f"{self.min_val:,}"
+                max_s = f"{self.max_val:,}"
+            else:
+                min_s = f"{self.min_val}"
+                max_s = f"{self.max_val}"
+            u = f" {self.unit}" if self.unit else ""
+            return f"範囲: {min_s} 〜 {max_s}{u}"
+        return ""
+
+
+def get_param_specs(context_length: int = 2048, model_params: dict[str, str] | None = None) -> list[ParamMeta]:
+    """Generates parameter metadata reflecting the model's info (e.g. context length, defaults)."""
+    mp = {k.lower(): str(v) for k, v in (model_params or {}).items()}
+    ctx_max = max(context_length, 2048)
+
+    return [
+        ParamMeta(
+            key="temperature",
+            name="Temperature",
+            default=mp.get("temperature", "0.8"),
+            min_val=0.0,
+            max_val=2.0,
+            step=0.05,
+            val_type="float",
+            description="生成のランダム性（0.0: 決定論的/論理的 〜 2.0: 創造的）",
+        ),
+        ParamMeta(
+            key="num_ctx",
+            name="コンテキスト長 (num_ctx)",
+            default=mp.get("num_ctx", "2048"),
+            min_val=512,
+            max_val=ctx_max,
+            step=512,
+            val_type="int",
+            unit="tokens",
+            description=f"文脈ウィンドウサイズ（モデル上限 {ctx_max:,} tokens まで指定可能）",
+        ),
+        ParamMeta(
+            key="top_p",
+            name="Top-P",
+            default=mp.get("top_p", "0.9"),
+            min_val=0.0,
+            max_val=1.0,
+            step=0.05,
+            val_type="float",
+            description="累積確率サンプリング閾値（低いほど確実な語を選択）",
+        ),
+        ParamMeta(
+            key="top_k",
+            name="Top-K",
+            default=mp.get("top_k", "40"),
+            min_val=1,
+            max_val=100,
+            step=1,
+            val_type="int",
+            description="サンプリング候補トークン数の上限",
+        ),
+        ParamMeta(
+            key="repeat_penalty",
+            name="繰り返しペナルティ (repeat_penalty)",
+            default=mp.get("repeat_penalty", "1.1"),
+            min_val=0.0,
+            max_val=2.0,
+            step=0.05,
+            val_type="float",
+            description="同じ単語の繰り返しへのペナルティ（1.0 = ペナルティ無効）",
+        ),
+        ParamMeta(
+            key="repeat_last_n",
+            name="ペナルティ履歴長 (repeat_last_n)",
+            default=mp.get("repeat_last_n", "64"),
+            min_val=0,
+            max_val=ctx_max,
+            step=16,
+            val_type="int",
+            unit="tokens",
+            description="繰り返し判定の対象とする直近トークン数（0 = 無効）",
+        ),
+        ParamMeta(
+            key="num_predict",
+            name="最大生成トークン数 (num_predict)",
+            default=mp.get("num_predict", "-1"),
+            min_val=-1,
+            max_val=ctx_max,
+            step=128,
+            val_type="int",
+            unit="tokens",
+            description="生成トークン数の上限（-1: 無制限 / コンテキスト上限まで）",
+        ),
+        ParamMeta(
+            key="seed",
+            name="シード値 (seed)",
+            default=mp.get("seed", "0"),
+            min_val=0,
+            max_val=2147483647,
+            step=1,
+            val_type="int",
+            description="乱数シード（0: 実行ごとにランダム）",
+        ),
+        ParamMeta(
+            key="stop",
+            name="停止文字列 (stop)",
+            default=mp.get("stop", ""),
+            min_val=None,
+            max_val=None,
+            step=None,
+            val_type="string",
+            description="生成を停止する文字列（例: <|im_end|>）",
+        ),
+    ]
+
+
 def validate_ollama_model_name(name: str) -> str | None:
     """Returns an error string if the model name is invalid, or None if valid."""
     name = name.strip()

@@ -109,6 +109,13 @@ def test_gui_ollama_tab(app, monkeypatch):
     assert "abc123" in w.om_info_label.text()
     assert "mock-qwen-custom:latest" in w.om_name_edit.text()
 
+    # Check parameter guides show defaults and ranges
+    assert "0.0 〜 2.0" in w.om_param_guides["temperature"].text()
+    assert "デフォルト:" in w.om_param_guides["temperature"].text()
+    assert "512 〜" in w.om_param_guides["num_ctx"].text()
+    assert "0.0 〜 1.0" in w.om_param_guides["top_p"].text()
+    assert "1 〜 100" in w.om_param_guides["top_k"].text()
+
     # Load base settings
     w._load_om_base_settings()
     assert "FROM mock-qwen:7b" in w.om_modelfile_edit.toPlainText()

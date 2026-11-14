@@ -7,7 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
@@ -142,6 +142,82 @@ def ollama_show_modelfile(model_name: str) -> str | None:
     if p.returncode != 0:
         return None
     return p.stdout.decode("utf-8", errors="replace")
+
+
+@dataclass
+class OllamaModelDetails:
+    architecture: str = ""
+    parameters_size: str = ""
+    context_length: int = 2048
+    embedding_length: int = 0
+    quantization: str = ""
+    system: str = ""
+    model_parameters: dict[str, str] = field(default_factory=dict)
+    raw_show: str = ""
+
+
+def parse_ollama_show_output(raw: str) -> OllamaModelDetails:
+    """Parses `ollama show <model>` plain text output into OllamaModelDetails."""
+    details = OllamaModelDetails(raw_show=raw)
+    current_section = ""
+    lines = raw.splitlines()
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # Section header check (starts with 2 spaces or 0 spaces)
+        if (line.startswith("  ") and not line.startswith("    ")) or not line.startswith(" "):
+            current_section = stripped.lower()
+            continue
+
+        if current_section == "model":
+            parts = stripped.split(maxsplit=1)
+            if len(parts) == 2:
+                k = parts[0].lower()
+                v = parts[1].strip()
+                if k == "architecture":
+                    details.architecture = v
+                elif k == "parameters":
+                    details.parameters_size = v
+                elif k == "quantization":
+                    details.quantization = v
+                elif k == "context" and v.lower().startswith("length"):
+                    sub = v.split(maxsplit=1)
+                    if len(sub) == 2 and sub[1].isdigit():
+                        details.context_length = int(sub[1])
+                elif k == "embedding" and v.lower().startswith("length"):
+                    sub = v.split(maxsplit=1)
+                    if len(sub) == 2 and sub[1].isdigit():
+                        details.embedding_length = int(sub[1])
+        elif current_section == "parameters":
+            parts = stripped.split(maxsplit=1)
+            if len(parts) == 2:
+                details.model_parameters[parts[0].lower()] = parts[1].strip()
+        elif current_section == "system":
+            if details.system:
+                details.system += "\n" + line.strip()
+            else:
+                details.system = line.strip()
+
+    return details
+
+
+def ollama_show_details(model_name: str) -> OllamaModelDetails | None:
+    """Fetches and parses detailed model info via `ollama show <name>`."""
+    exe = ollama_exe()
+    if exe is None:
+        return None
+    try:
+        p = subprocess.run([str(exe), "show", model_name],
+                           capture_output=True, timeout=15, creationflags=CREATE_NO_WINDOW,
+                           stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if p.returncode != 0:
+        return None
+    return parse_ollama_show_output(p.stdout.decode("utf-8", errors="replace"))
 
 
 def forget_ollama_cache() -> None:

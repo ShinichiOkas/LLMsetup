@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSplitter,
     QTabWidget,
@@ -80,6 +82,8 @@ class MainWindow(QMainWindow):
 
         # Ollama Modelfile tab state
         self.om_models: list[tools.OllamaModelItem] = []
+        self.om_details: tools.OllamaModelDetails | None = None
+        self.om_param_guides: dict[str, QLabel] = {}
         self.om_job: om.OllamaCreateJob | None = None
         self._om_name_auto = True
         self._om_initialized = False
@@ -330,40 +334,77 @@ class MainWindow(QMainWindow):
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # Left: simple form
+        # Left: scrollable form
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
-        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setContentsMargins(0, 0, 8, 0)
         left_layout.setSpacing(6)
 
         left_layout.addWidget(QLabel("システムプロンプト (SYSTEM):"))
         self.om_system_edit = QPlainTextEdit()
         self.om_system_edit.setPlaceholderText("モデルへのシステム指示（例: あなたは優秀なプログラミングアシスタントです。）")
-        self.om_system_edit.setMaximumHeight(120)
+        self.om_system_edit.setMaximumHeight(90)
         left_layout.addWidget(self.om_system_edit)
 
         f_params = QFormLayout()
-        self.om_temp_edit = QLineEdit()
-        self.om_temp_edit.setPlaceholderText("例: 0.7（未入力時はベースに従う）")
-        f_params.addRow("temperature:", self.om_temp_edit)
+        f_params.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        f_params.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
+        self.om_param_guides: dict[str, QLabel] = {}
+
+        def add_param_row(key: str, label_text: str, edit_widget: QWidget, initial_guide: str = "") -> None:
+            container = QWidget()
+            h = QHBoxLayout(container)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(10)
+            edit_widget.setFixedWidth(120)
+            h.addWidget(edit_widget, 0)
+            guide = QLabel(initial_guide)
+            guide.setStyleSheet("color: palette(placeholder-text);")
+            h.addWidget(guide, 1)
+            f_params.addRow(label_text, container)
+            self.om_param_guides[key] = guide
+
+        # 1. temperature
+        self.om_temp_edit = QLineEdit()
+        add_param_row("temperature", "temperature:", self.om_temp_edit, "デフォルト: 0.8  |  範囲: 0.0 〜 2.0")
+
+        # 2. num_ctx
         self.om_ctx_combo = QComboBox()
         self.om_ctx_combo.setEditable(True)
-        self.om_ctx_combo.addItems(["", "2048", "4096", "8192", "16384", "32768", "65536", "131072"])
-        self.om_ctx_combo.setPlaceholderText("未入力時はベースに従う")
-        f_params.addRow("num_ctx:", self.om_ctx_combo)
+        add_param_row("num_ctx", "num_ctx:", self.om_ctx_combo, "デフォルト: 2048  |  範囲: 512 〜 2,048 tokens")
 
+        # 3. top_p
         self.om_topp_edit = QLineEdit()
-        self.om_topp_edit.setPlaceholderText("例: 0.9（未入力時はベースに従う）")
-        f_params.addRow("top_p:", self.om_topp_edit)
+        add_param_row("top_p", "top_p:", self.om_topp_edit, "デフォルト: 0.9  |  範囲: 0.0 〜 1.0")
 
+        # 4. top_k
+        self.om_topk_edit = QLineEdit()
+        add_param_row("top_k", "top_k:", self.om_topk_edit, "デフォルト: 40  |  範囲: 1 〜 100")
+
+        # 5. repeat_penalty
         self.om_rep_edit = QLineEdit()
-        self.om_rep_edit.setPlaceholderText("例: 1.1（未入力時はベースに従う）")
-        f_params.addRow("repeat_penalty:", self.om_rep_edit)
+        add_param_row("repeat_penalty", "repeat_penalty:", self.om_rep_edit, "デフォルト: 1.1  |  範囲: 0.0 〜 2.0")
 
+        # 6. repeat_last_n
+        self.om_replast_edit = QLineEdit()
+        add_param_row("repeat_last_n", "repeat_last_n:", self.om_replast_edit, "デフォルト: 64  |  範囲: 0 〜 2,048 tokens")
+
+        # 7. num_predict
+        self.om_predict_edit = QLineEdit()
+        add_param_row("num_predict", "num_predict:", self.om_predict_edit, "デフォルト: -1 (無制限)  |  範囲: -1 または 1 〜 2,048")
+
+        # 8. seed
+        self.om_seed_edit = QLineEdit()
+        add_param_row("seed", "seed:", self.om_seed_edit, "デフォルト: 0 (ランダム)  |  範囲: 0 〜 2,147,483,647")
+
+        # 9. stop
         self.om_stop_edit = QLineEdit()
-        self.om_stop_edit.setPlaceholderText("例: <|im_end|>（未入力時はベースに従う）")
-        f_params.addRow("stop:", self.om_stop_edit)
+        add_param_row("stop", "stop:", self.om_stop_edit, "停止文字列（例: <|im_end|>）")
 
         left_layout.addLayout(f_params)
 
@@ -372,7 +413,8 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(btn_apply)
         left_layout.addStretch(1)
 
-        splitter.addWidget(left_widget)
+        scroll.setWidget(left_widget)
+        splitter.addWidget(scroll)
 
         # Right: Modelfile text editor / preview
         right_widget = QWidget()
@@ -852,7 +894,7 @@ class MainWindow(QMainWindow):
             self.om_info_label.setText("-")
             return
         m = self.om_models[index]
-        self.om_info_label.setText(f"ID: {m.id}  |  サイズ: {m.size}  |  更新: {m.modified}")
+        self._update_model_info_and_guides(m.name, m)
 
         # Auto-suggest new model name if not manually edited
         if self._om_name_auto or not self.om_name_edit.text().strip():
@@ -862,8 +904,97 @@ class MainWindow(QMainWindow):
 
         # If modelfile is empty or just FROM, set new FROM
         current_mf = self.om_modelfile_edit.toPlainText().strip()
-        if not current_mf or current_mf.startswith("FROM ") and "\n" not in current_mf:
+        if not current_mf or (current_mf.startswith("FROM ") and "\n" not in current_mf):
             self.om_modelfile_edit.setPlainText(f"FROM {m.name}\n")
+
+    def _update_model_info_and_guides(self, model_name: str, item: tools.OllamaModelItem | None = None) -> None:
+        details = tools.ollama_show_details(model_name)
+        self.om_details = details
+
+        ctx_len = details.context_length if details else 2048
+        arch = details.architecture if details else ""
+        param_cnt = details.parameters_size if details else ""
+        quant = details.quantization if details else ""
+        size_str = item.size if item else ""
+
+        info_parts = []
+        if item and item.id:
+            info_parts.append(f"ID: {item.id}")
+        if arch:
+            info_parts.append(f"アーキテクチャ: {arch}")
+        if param_cnt:
+            info_parts.append(f"パラメータ: {param_cnt}")
+        info_parts.append(f"最大コンテキスト: {ctx_len:,} tokens")
+        if quant:
+            info_parts.append(f"量子化: {quant}")
+        if size_str:
+            info_parts.append(f"サイズ: {size_str}")
+
+        self.om_info_label.setText("  |  ".join(info_parts) if info_parts else "-")
+
+        # Update parameter guides and dropdown options based on model info
+        specs = om.get_param_specs(context_length=ctx_len, model_params=details.model_parameters if details else None)
+        specs_dict = {s.key: s for s in specs}
+
+        # temperature
+        if "temperature" in self.om_param_guides and "temperature" in specs_dict:
+            s = specs_dict["temperature"]
+            self.om_param_guides["temperature"].setText(f"デフォルト: {s.default}  |  {s.range_text()}")
+            self.om_temp_edit.setPlaceholderText(f"既定: {s.default}")
+
+        # num_ctx
+        if "num_ctx" in self.om_param_guides and "num_ctx" in specs_dict:
+            s = specs_dict["num_ctx"]
+            self.om_param_guides["num_ctx"].setText(f"デフォルト: {s.default}  |  {s.range_text()} (モデル上限)")
+            cur_ctx = self.om_ctx_combo.currentText()
+            candidates = [c for c in [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576] if c <= ctx_len]
+            if ctx_len not in candidates and ctx_len > 512:
+                candidates.append(ctx_len)
+            self.om_ctx_combo.blockSignals(True)
+            self.om_ctx_combo.clear()
+            self.om_ctx_combo.addItem("")
+            for c in sorted(candidates):
+                self.om_ctx_combo.addItem(str(c))
+            if cur_ctx:
+                self.om_ctx_combo.setEditText(cur_ctx)
+            self.om_ctx_combo.setPlaceholderText(f"未入力時はベース ({s.default}) に従う")
+            self.om_ctx_combo.blockSignals(False)
+
+        # top_p
+        if "top_p" in self.om_param_guides and "top_p" in specs_dict:
+            s = specs_dict["top_p"]
+            self.om_param_guides["top_p"].setText(f"デフォルト: {s.default}  |  {s.range_text()}")
+            self.om_topp_edit.setPlaceholderText(f"既定: {s.default}")
+
+        # top_k
+        if "top_k" in self.om_param_guides and "top_k" in specs_dict:
+            s = specs_dict["top_k"]
+            self.om_param_guides["top_k"].setText(f"デフォルト: {s.default}  |  {s.range_text()}")
+            self.om_topk_edit.setPlaceholderText(f"既定: {s.default}")
+
+        # repeat_penalty
+        if "repeat_penalty" in self.om_param_guides and "repeat_penalty" in specs_dict:
+            s = specs_dict["repeat_penalty"]
+            self.om_param_guides["repeat_penalty"].setText(f"デフォルト: {s.default}  |  {s.range_text()}")
+            self.om_rep_edit.setPlaceholderText(f"既定: {s.default}")
+
+        # repeat_last_n
+        if "repeat_last_n" in self.om_param_guides and "repeat_last_n" in specs_dict:
+            s = specs_dict["repeat_last_n"]
+            self.om_param_guides["repeat_last_n"].setText(f"デフォルト: {s.default}  |  {s.range_text()}")
+            self.om_replast_edit.setPlaceholderText(f"既定: {s.default}")
+
+        # num_predict
+        if "num_predict" in self.om_param_guides and "num_predict" in specs_dict:
+            s = specs_dict["num_predict"]
+            self.om_param_guides["num_predict"].setText(f"デフォルト: -1 (無制限)  |  範囲: -1 または 1 〜 {ctx_len:,}")
+            self.om_predict_edit.setPlaceholderText("既定: -1")
+
+        # seed
+        if "seed" in self.om_param_guides and "seed" in specs_dict:
+            s = specs_dict["seed"]
+            self.om_param_guides["seed"].setText(f"デフォルト: 0 (ランダム)  |  {s.range_text()}")
+            self.om_seed_edit.setPlaceholderText("既定: 0")
 
     def _on_om_name_edited(self, _text: str) -> None:
         self._om_name_auto = False
@@ -888,16 +1019,29 @@ class MainWindow(QMainWindow):
         sec = om.parse_modelfile_sections(cleaned)
         self.om_system_edit.setPlainText(sec["system"])
 
-        # Populate param inputs if present
+        # Populate param inputs if present in Modelfile or in model_parameters
         params = dict(sec["parameters"])
+        if self.om_details and self.om_details.model_parameters:
+            for k, v in self.om_details.model_parameters.items():
+                if k not in params:
+                    params[k] = v
+
         if "temperature" in params:
             self.om_temp_edit.setText(params["temperature"])
         if "num_ctx" in params:
             self.om_ctx_combo.setEditText(params["num_ctx"])
         if "top_p" in params:
             self.om_topp_edit.setText(params["top_p"])
+        if "top_k" in params:
+            self.om_topk_edit.setText(params["top_k"])
         if "repeat_penalty" in params:
             self.om_rep_edit.setText(params["repeat_penalty"])
+        if "repeat_last_n" in params:
+            self.om_replast_edit.setText(params["repeat_last_n"])
+        if "num_predict" in params:
+            self.om_predict_edit.setText(params["num_predict"])
+        if "seed" in params:
+            self.om_seed_edit.setText(params["seed"])
         if "stop" in params:
             self.om_stop_edit.setText(params["stop"])
 
@@ -920,8 +1064,16 @@ class MainWindow(QMainWindow):
             params.append(("num_ctx", self.om_ctx_combo.currentText().strip()))
         if self.om_topp_edit.text().strip():
             params.append(("top_p", self.om_topp_edit.text().strip()))
+        if self.om_topk_edit.text().strip():
+            params.append(("top_k", self.om_topk_edit.text().strip()))
         if self.om_rep_edit.text().strip():
             params.append(("repeat_penalty", self.om_rep_edit.text().strip()))
+        if self.om_replast_edit.text().strip():
+            params.append(("repeat_last_n", self.om_replast_edit.text().strip()))
+        if self.om_predict_edit.text().strip():
+            params.append(("num_predict", self.om_predict_edit.text().strip()))
+        if self.om_seed_edit.text().strip():
+            params.append(("seed", self.om_seed_edit.text().strip()))
         if self.om_stop_edit.text().strip():
             params.append(("stop", self.om_stop_edit.text().strip()))
 
@@ -949,7 +1101,11 @@ class MainWindow(QMainWindow):
         self.om_temp_edit.clear()
         self.om_ctx_combo.setCurrentIndex(0)
         self.om_topp_edit.clear()
+        self.om_topk_edit.clear()
         self.om_rep_edit.clear()
+        self.om_replast_edit.clear()
+        self.om_predict_edit.clear()
+        self.om_seed_edit.clear()
         self.om_stop_edit.clear()
         self._set_om_status("Modelfile を初期化しました", None)
 

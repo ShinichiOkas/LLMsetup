@@ -64,3 +64,46 @@ def test_parse_modelfile_sections():
     assert ("temperature", "0.5") in sections["parameters"]
     assert ("top_p", "0.9") in sections["parameters"]
     assert "# Extra comment" in sections["extra"]
+
+
+def test_get_param_specs():
+    specs = om.get_param_specs(context_length=32768, model_params={"temperature": "1.0", "top_k": "50"})
+    specs_dict = {s.key: s for s in specs}
+
+    assert specs_dict["temperature"].default == "1.0"
+    assert specs_dict["temperature"].min_val == 0.0
+    assert specs_dict["temperature"].max_val == 2.0
+    assert "0.0 〜 2.0" in specs_dict["temperature"].range_text()
+
+    assert specs_dict["num_ctx"].max_val == 32768
+    assert "32,768 tokens" in specs_dict["num_ctx"].range_text()
+    assert specs_dict["top_k"].default == "50"
+
+
+def test_parse_ollama_show_output():
+    from llmquant import tools
+
+    raw = """
+  Model
+    architecture        qwen2
+    parameters          7.6B
+    context length      32768
+    embedding length    3584
+    quantization        Q4_K_M
+
+  Parameters
+    temperature    0.7
+    top_p          0.95
+
+  System
+    You are an expert coder.
+"""
+    details = tools.parse_ollama_show_output(raw)
+    assert details.architecture == "qwen2"
+    assert details.parameters_size == "7.6B"
+    assert details.context_length == 32768
+    assert details.embedding_length == 3584
+    assert details.quantization == "Q4_K_M"
+    assert details.model_parameters["temperature"] == "0.7"
+    assert details.model_parameters["top_p"] == "0.95"
+    assert "expert coder" in details.system
