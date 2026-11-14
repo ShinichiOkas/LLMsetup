@@ -70,11 +70,19 @@ def ollama_models_dir() -> Path:
     return Path(env) if env else Path.home() / ".ollama" / "models"
 
 
-_ollama_cache: tuple[float, set[str] | None] = (0.0, None)
+@dataclass(frozen=True)
+class OllamaModelItem:
+    name: str
+    id: str = ""
+    size: str = ""
+    modified: str = ""
 
 
-def ollama_model_names(max_age: float = 5.0) -> set[str] | None:
-    """Names (``name:tag``) registered in Ollama, or None if it cannot be asked."""
+_ollama_cache: tuple[float, list[OllamaModelItem] | None] = (0.0, None)
+
+
+def ollama_list_models(max_age: float = 5.0) -> list[OllamaModelItem] | None:
+    """Detailed list of models registered in Ollama, or None if it cannot be asked."""
     global _ollama_cache
     import time
 
@@ -91,13 +99,49 @@ def ollama_model_names(max_age: float = 5.0) -> set[str] | None:
         return None
     if p.returncode != 0:
         return None
-    names = set()
-    for line in p.stdout.decode("utf-8", errors="replace").splitlines()[1:]:
+    items: list[OllamaModelItem] = []
+    lines = p.stdout.decode("utf-8", errors="replace").splitlines()
+    for line in lines[1:]:
         parts = line.split()
-        if parts:
-            names.add(parts[0].lower())
-    _ollama_cache = (now, names)
-    return names
+        if not parts:
+            continue
+        name = parts[0]
+        mid = parts[1] if len(parts) > 1 else ""
+        size = ""
+        modified = ""
+        if len(parts) >= 4 and parts[3].upper() in ("B", "KB", "MB", "GB", "TB"):
+            size = f"{parts[2]} {parts[3]}"
+            modified = " ".join(parts[4:])
+        elif len(parts) >= 3:
+            size = parts[2]
+            modified = " ".join(parts[3:])
+        items.append(OllamaModelItem(name=name, id=mid, size=size, modified=modified))
+    _ollama_cache = (now, items)
+    return items
+
+
+def ollama_model_names(max_age: float = 5.0) -> set[str] | None:
+    """Names (``name:tag``) registered in Ollama, or None if it cannot be asked."""
+    items = ollama_list_models(max_age=max_age)
+    if items is None:
+        return None
+    return {m.name.lower() for m in items}
+
+
+def ollama_show_modelfile(model_name: str) -> str | None:
+    """Raw modelfile string for a model from ``ollama show <name> --modelfile``."""
+    exe = ollama_exe()
+    if exe is None:
+        return None
+    try:
+        p = subprocess.run([str(exe), "show", model_name, "--modelfile"],
+                           capture_output=True, timeout=15, creationflags=CREATE_NO_WINDOW,
+                           stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if p.returncode != 0:
+        return None
+    return p.stdout.decode("utf-8", errors="replace")
 
 
 def forget_ollama_cache() -> None:

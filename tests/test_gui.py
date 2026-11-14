@@ -83,3 +83,58 @@ def test_checkbox_flags(app, jp_dir: Path):
         flags = w.table.item(r, COL_CHECK).flags()
         assert bool(flags & Qt.ItemFlag.ItemIsEnabled) == o.enabled
     w.close()
+
+
+def test_gui_ollama_tab(app, monkeypatch):
+    from llmquant.tools import OllamaModelItem
+
+    mock_models = [
+        OllamaModelItem(name="mock-qwen:7b", id="abc123", size="4.5 GB", modified="yesterday"),
+        OllamaModelItem(name="mock-llama:latest", id="def456", size="2.0 GB", modified="today"),
+    ]
+    monkeypatch.setattr("llmquant.tools.ollama_list_models", lambda max_age=0.0: mock_models)
+    monkeypatch.setattr("llmquant.tools.ollama_model_names", lambda max_age=0.0: {"mock-qwen:7b", "mock-llama:latest"})
+    monkeypatch.setattr("llmquant.tools.ollama_show_modelfile", lambda name: f'FROM blob123\nSYSTEM You are an assistant.\nPARAMETER temperature 0.8\n')
+
+    w = MainWindow()
+    assert w.tabs.count() == 2
+    assert w.tabs.tabText(0) == "GGUF 量子化"
+    assert w.tabs.tabText(1) == "Ollama モデル作成"
+
+    # Switch to Ollama tab
+    w.tabs.setCurrentIndex(1)
+    assert w._om_initialized
+    assert w.om_base_combo.count() == 2
+    assert w.om_base_combo.currentText() == "mock-qwen:7b"
+    assert "abc123" in w.om_info_label.text()
+    assert "mock-qwen-custom:latest" in w.om_name_edit.text()
+
+    # Load base settings
+    w._load_om_base_settings()
+    assert "FROM mock-qwen:7b" in w.om_modelfile_edit.toPlainText()
+    assert w.om_system_edit.toPlainText() == "You are an assistant."
+    assert w.om_temp_edit.text() == "0.8"
+
+    # Edit form and apply
+    w.om_system_edit.setPlainText("Custom system prompt.")
+    w.om_temp_edit.setText("0.5")
+    w.om_ctx_combo.setEditText("8192")
+    w._apply_form_to_modelfile()
+
+    mf = w.om_modelfile_edit.toPlainText()
+    assert 'SYSTEM """Custom system prompt."""' in mf
+    assert "PARAMETER temperature 0.5" in mf
+    assert "PARAMETER num_ctx 8192" in mf
+
+    # Reset
+    w._reset_modelfile()
+    assert w.om_modelfile_edit.toPlainText().strip() == "FROM mock-qwen:7b"
+    assert w.om_system_edit.toPlainText() == ""
+
+    # Name validation
+    w.om_name_edit.setText("INVALID NAME!")
+    w._start_om_create()
+    assert "使えない文字" in w.om_status.text()
+    assert w.om_run_btn.isEnabled()
+
+    w.close()

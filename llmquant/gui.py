@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -27,6 +28,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QSplitter,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -34,6 +36,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__, tools
+from . import ollama_modelfile as om
 from .basemodel import KIND_GGUF, KIND_HF, BaseInfo, human_bytes, human_params, inspect_base, ollama_name, output_filename
 from .options import STATUS_DISABLED, STATUS_WARN, Environment, Option, build_options, fits_vram
 from .pipeline import Cancelled, JobError, JobSpec, Runner, check_outputs, dry_run_size, plan
@@ -53,6 +56,12 @@ class _Signals(QObject):
     sized = Signal(str, object, bool)  # qtype, bytes|None, needs_imatrix
 
 
+class _OllamaSignals(QObject):
+    log = Signal(str)
+    progress = Signal(float, str)
+    finished = Signal(bool)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -68,6 +77,17 @@ class MainWindow(QMainWindow):
         self._size_gen = 0
         self._out_dir_auto = True
         self._ollama_stem_auto = True
+
+        # Ollama Modelfile tab state
+        self.om_models: list[tools.OllamaModelItem] = []
+        self.om_job: om.OllamaCreateJob | None = None
+        self._om_name_auto = True
+        self._om_initialized = False
+        self.om_sig = _OllamaSignals()
+        self.om_sig.log.connect(self._append_om_log)
+        self.om_sig.progress.connect(self._on_om_progress)
+        self.om_sig.finished.connect(self._on_om_finished)
+
         self._build()
         self.setAcceptDrops(True)
         self._refresh_tools()
@@ -82,8 +102,29 @@ class MainWindow(QMainWindow):
 
         central = QWidget()
         root = QVBoxLayout(central)
-        root.setContentsMargins(12, 10, 12, 10)
-        root.setSpacing(8)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
+
+        self.tabs = QTabWidget()
+        root.addWidget(self.tabs, 1)
+
+        quant_widget = self._build_quant_tab()
+        self.tabs.addTab(quant_widget, "GGUF 量子化")
+
+        ollama_widget = self._build_ollama_tab()
+        self.tabs.addTab(ollama_widget, "Ollama モデル作成")
+
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        self.setCentralWidget(central)
+
+        vram = tools.gpu_vram_bytes()
+        self.info_labels["GPU"].setText(f"VRAM {human_bytes(vram)}" if vram else "（検出なし）")
+
+    def _build_quant_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(8)
 
         # 1. base
         g1 = QGroupBox("1. ベースモデル（HF 形式のフォルダ、または .gguf）")
@@ -122,7 +163,7 @@ class MainWindow(QMainWindow):
         self.msg_label.setTextFormat(Qt.TextFormat.RichText)
         self.msg_label.hide()
         l1.addWidget(self.msg_label)
-        root.addWidget(g1)
+        layout.addWidget(g1)
 
         # 2. options
         g2 = QGroupBox("2. 量子化の種類（作りたいものに印。複数可）")
@@ -251,8 +292,172 @@ class MainWindow(QMainWindow):
         split.setStretchFactor(0, 4)
         split.setStretchFactor(1, 1)
         split.setChildrenCollapsible(False)
-        root.addWidget(split, 1)
-        self.setCentralWidget(central)
+        layout.addWidget(split, 1)
+        return w
+
+    def _build_ollama_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(8)
+
+        # 1. base model
+        g1 = QGroupBox("1. ベースモデル（Ollama ダウンロード済みモデル）")
+        l1 = QVBoxLayout(g1)
+        r1 = QHBoxLayout()
+        self.om_base_combo = QComboBox()
+        self.om_base_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.om_base_combo.currentIndexChanged.connect(self._on_om_model_selected)
+        self.om_refresh_btn = QPushButton("一覧を更新")
+        self.om_refresh_btn.clicked.connect(self._refresh_ollama_models)
+        self.om_load_btn = QPushButton("ベースの設定を読み込む")
+        self.om_load_btn.clicked.connect(self._load_om_base_settings)
+        r1.addWidget(QLabel("ベースモデル:"), 0)
+        r1.addWidget(self.om_base_combo, 1)
+        r1.addWidget(self.om_refresh_btn)
+        r1.addWidget(self.om_load_btn)
+        l1.addLayout(r1)
+
+        self.om_info_label = QLabel("-")
+        self.om_info_label.setStyleSheet("color: palette(placeholder-text);")
+        self.om_info_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        l1.addWidget(self.om_info_label)
+        layout.addWidget(g1)
+
+        # 2. model definition (Modelfile)
+        g2 = QGroupBox("2. モデル定義（Modelfile）")
+        l2 = QVBoxLayout(g2)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # Left: simple form
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(6)
+
+        left_layout.addWidget(QLabel("システムプロンプト (SYSTEM):"))
+        self.om_system_edit = QPlainTextEdit()
+        self.om_system_edit.setPlaceholderText("モデルへのシステム指示（例: あなたは優秀なプログラミングアシスタントです。）")
+        self.om_system_edit.setMaximumHeight(120)
+        left_layout.addWidget(self.om_system_edit)
+
+        f_params = QFormLayout()
+        self.om_temp_edit = QLineEdit()
+        self.om_temp_edit.setPlaceholderText("例: 0.7（未入力時はベースに従う）")
+        f_params.addRow("temperature:", self.om_temp_edit)
+
+        self.om_ctx_combo = QComboBox()
+        self.om_ctx_combo.setEditable(True)
+        self.om_ctx_combo.addItems(["", "2048", "4096", "8192", "16384", "32768", "65536", "131072"])
+        self.om_ctx_combo.setPlaceholderText("未入力時はベースに従う")
+        f_params.addRow("num_ctx:", self.om_ctx_combo)
+
+        self.om_topp_edit = QLineEdit()
+        self.om_topp_edit.setPlaceholderText("例: 0.9（未入力時はベースに従う）")
+        f_params.addRow("top_p:", self.om_topp_edit)
+
+        self.om_rep_edit = QLineEdit()
+        self.om_rep_edit.setPlaceholderText("例: 1.1（未入力時はベースに従う）")
+        f_params.addRow("repeat_penalty:", self.om_rep_edit)
+
+        self.om_stop_edit = QLineEdit()
+        self.om_stop_edit.setPlaceholderText("例: <|im_end|>（未入力時はベースに従う）")
+        f_params.addRow("stop:", self.om_stop_edit)
+
+        left_layout.addLayout(f_params)
+
+        btn_apply = QPushButton("フォームの内容を Modelfile に反映 →")
+        btn_apply.clicked.connect(self._apply_form_to_modelfile)
+        left_layout.addWidget(btn_apply)
+        left_layout.addStretch(1)
+
+        splitter.addWidget(left_widget)
+
+        # Right: Modelfile text editor / preview
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(6)
+
+        header_row = QHBoxLayout()
+        header_row.addWidget(QLabel("Modelfile の内容（直接編集可）:"), 1)
+        btn_reset = QPushButton("再構築 / クリア")
+        btn_reset.clicked.connect(self._reset_modelfile)
+        header_row.addWidget(btn_reset)
+        right_layout.addLayout(header_row)
+
+        self.om_modelfile_edit = QPlainTextEdit()
+        mono = QFont("Consolas")
+        mono.setStyleHint(QFont.StyleHint.Monospace)
+        mono.setPointSize(9)
+        self.om_modelfile_edit.setFont(mono)
+        self.om_modelfile_edit.setPlaceholderText("FROM <base_model>\nSYSTEM \"\"\"...\"\"\"\nPARAMETER temperature 0.7")
+        right_layout.addWidget(self.om_modelfile_edit)
+
+        splitter.addWidget(right_widget)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        l2.addWidget(splitter)
+        layout.addWidget(g2, 1)
+
+        # 3. Target model & Run
+        g3 = QGroupBox("3. 作成設定 & 実行")
+        l3 = QVBoxLayout(g3)
+        row_cfg = QHBoxLayout()
+        self.om_name_edit = QLineEdit()
+        self.om_name_edit.setPlaceholderText("例: my-model:latest（英小文字、数字、. _ - :）")
+        self.om_name_edit.textEdited.connect(self._on_om_name_edited)
+        self.om_overwrite_chk = QCheckBox("同名のモデルを上書きする")
+        self.om_overwrite_chk.setChecked(True)
+        row_cfg.addWidget(QLabel("新規モデル名:"), 0)
+        row_cfg.addWidget(self.om_name_edit, 1)
+        row_cfg.addWidget(self.om_overwrite_chk, 0)
+        l3.addLayout(row_cfg)
+
+        row_run = QHBoxLayout()
+        self.om_run_btn = QPushButton("モデルを作成（ollama create）")
+        self.om_run_btn.setMinimumHeight(34)
+        f = self.om_run_btn.font()
+        f.setBold(True)
+        self.om_run_btn.setFont(f)
+        self.om_run_btn.clicked.connect(self._start_om_create)
+
+        self.om_cancel_btn = QPushButton("取り消し")
+        self.om_cancel_btn.setEnabled(False)
+        self.om_cancel_btn.clicked.connect(self._cancel_om_create)
+
+        self.om_progress = QProgressBar()
+        self.om_progress.setRange(0, 1000)
+        self.om_progress.setTextVisible(False)
+
+        row_run.addWidget(self.om_run_btn)
+        row_run.addWidget(self.om_cancel_btn)
+        row_run.addWidget(self.om_progress, 1)
+        l3.addLayout(row_run)
+
+        self.om_status = QLabel("")
+        self.om_status.setWordWrap(True)
+        self.om_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        l3.addWidget(self.om_status)
+
+        layout.addWidget(g3)
+
+        # 4. Logs
+        self.om_log = QPlainTextEdit()
+        self.om_log.setReadOnly(True)
+        self.om_log.setMaximumBlockCount(3000)
+        self.om_log.setFont(mono)
+        self.om_log.setPlaceholderText("実行ログ")
+        self.om_log.setMaximumHeight(160)
+        layout.addWidget(self.om_log)
+
+        return w
+
+    def _on_tab_changed(self, index: int) -> None:
+        if index == 1 and not self._om_initialized:
+            self._refresh_ollama_models()
+            self._om_initialized = True
 
         vram = tools.gpu_vram_bytes()
         self.info_labels["GPU"].setText(f"VRAM {human_bytes(vram)}" if vram else "（検出なし）")
@@ -593,6 +798,8 @@ class MainWindow(QMainWindow):
             lines = [f"完了（{res.seconds:.0f} 秒）: " + ", ".join(p.name for p in res.outputs.values())]
             if res.ollama_models:
                 lines.append("Ollama: " + " / ".join(f"ollama run {n}" for n in res.ollama_models.values()))
+                if self._om_initialized:
+                    self._refresh_ollama_models()
             msg = "<br>".join(_esc(x) for x in lines)
             if res.warnings:
                 msg += "<br>" + "<br>".join(
@@ -614,6 +821,211 @@ class MainWindow(QMainWindow):
         if d and Path(d).is_dir() and os.name == "nt":
             os.startfile(d)  # noqa: S606
 
+    # ------------------------------------------------------------ Ollama Modelfile tab
+    def _refresh_ollama_models(self) -> None:
+        tools.forget_ollama_cache()
+        models = tools.ollama_list_models(max_age=0.0)
+        self.om_models = models or []
+        current = self.om_base_combo.currentText()
+        self.om_base_combo.blockSignals(True)
+        self.om_base_combo.clear()
+        if not self.om_models:
+            self.om_base_combo.addItem("（モデルが見つかりません）")
+            self.om_info_label.setText("Ollama にダウンロード済みのモデルがありません。'ollama pull <name>' でモデルを取得してください。")
+            self.om_base_combo.blockSignals(False)
+            return
+
+        for m in self.om_models:
+            self.om_base_combo.addItem(m.name)
+
+        idx = 0
+        if current:
+            found = self.om_base_combo.findText(current)
+            if found >= 0:
+                idx = found
+        self.om_base_combo.setCurrentIndex(idx)
+        self.om_base_combo.blockSignals(False)
+        self._on_om_model_selected(idx)
+
+    def _on_om_model_selected(self, index: int) -> None:
+        if not self.om_models or index < 0 or index >= len(self.om_models):
+            self.om_info_label.setText("-")
+            return
+        m = self.om_models[index]
+        self.om_info_label.setText(f"ID: {m.id}  |  サイズ: {m.size}  |  更新: {m.modified}")
+
+        # Auto-suggest new model name if not manually edited
+        if self._om_name_auto or not self.om_name_edit.text().strip():
+            stem = m.name.split(":")[0].split("/")[-1]
+            self.om_name_edit.setText(f"{stem}-custom:latest")
+            self._om_name_auto = True
+
+        # If modelfile is empty or just FROM, set new FROM
+        current_mf = self.om_modelfile_edit.toPlainText().strip()
+        if not current_mf or current_mf.startswith("FROM ") and "\n" not in current_mf:
+            self.om_modelfile_edit.setPlainText(f"FROM {m.name}\n")
+
+    def _on_om_name_edited(self, _text: str) -> None:
+        self._om_name_auto = False
+
+    def _load_om_base_settings(self) -> None:
+        idx = self.om_base_combo.currentIndex()
+        if not self.om_models or idx < 0 or idx >= len(self.om_models):
+            self._set_om_status("モデルが選択されていません", self.c_red)
+            return
+        m = self.om_models[idx]
+        self._set_om_status(f"'{m.name}' の Modelfile を取得中...", None)
+        QApplication.processEvents()
+
+        raw_show = tools.ollama_show_modelfile(m.name)
+        if not raw_show:
+            self._set_om_status(f"'{m.name}' の設定を取得できませんでした（ollama show に失敗しました）", self.c_red)
+            return
+
+        cleaned = om.clean_show_modelfile(raw_show, m.name)
+        self.om_modelfile_edit.setPlainText(cleaned)
+
+        sec = om.parse_modelfile_sections(cleaned)
+        self.om_system_edit.setPlainText(sec["system"])
+
+        # Populate param inputs if present
+        params = dict(sec["parameters"])
+        if "temperature" in params:
+            self.om_temp_edit.setText(params["temperature"])
+        if "num_ctx" in params:
+            self.om_ctx_combo.setEditText(params["num_ctx"])
+        if "top_p" in params:
+            self.om_topp_edit.setText(params["top_p"])
+        if "repeat_penalty" in params:
+            self.om_rep_edit.setText(params["repeat_penalty"])
+        if "stop" in params:
+            self.om_stop_edit.setText(params["stop"])
+
+        self._set_om_status(f"'{m.name}' の Modelfile 設定を読み込みました", None)
+
+    def _apply_form_to_modelfile(self) -> None:
+        idx = self.om_base_combo.currentIndex()
+        base_name = self.om_models[idx].name if (self.om_models and 0 <= idx < len(self.om_models)) else "base"
+
+        # Check existing modelfile text to preserve template or extras
+        cur_text = self.om_modelfile_edit.toPlainText().strip()
+        sec = om.parse_modelfile_sections(cur_text) if cur_text else {}
+        template = sec.get("template", "")
+        extra = sec.get("extra", "")
+
+        params: list[tuple[str, str]] = []
+        if self.om_temp_edit.text().strip():
+            params.append(("temperature", self.om_temp_edit.text().strip()))
+        if self.om_ctx_combo.currentText().strip():
+            params.append(("num_ctx", self.om_ctx_combo.currentText().strip()))
+        if self.om_topp_edit.text().strip():
+            params.append(("top_p", self.om_topp_edit.text().strip()))
+        if self.om_rep_edit.text().strip():
+            params.append(("repeat_penalty", self.om_rep_edit.text().strip()))
+        if self.om_stop_edit.text().strip():
+            params.append(("stop", self.om_stop_edit.text().strip()))
+
+        # Preserve any additional parameters not in standard form
+        existing_param_keys = {p[0] for p in params}
+        for k, v in sec.get("parameters", []):
+            if k not in existing_param_keys:
+                params.append((k, v))
+
+        mf = om.build_modelfile(
+            from_model=base_name,
+            system=self.om_system_edit.toPlainText().strip(),
+            parameters=params,
+            template=template,
+            extra=extra,
+        )
+        self.om_modelfile_edit.setPlainText(mf)
+        self._set_om_status("フォームの内容を Modelfile に反映しました", None)
+
+    def _reset_modelfile(self) -> None:
+        idx = self.om_base_combo.currentIndex()
+        base_name = self.om_models[idx].name if (self.om_models and 0 <= idx < len(self.om_models)) else ""
+        self.om_modelfile_edit.setPlainText(f"FROM {base_name}\n" if base_name else "")
+        self.om_system_edit.clear()
+        self.om_temp_edit.clear()
+        self.om_ctx_combo.setCurrentIndex(0)
+        self.om_topp_edit.clear()
+        self.om_rep_edit.clear()
+        self.om_stop_edit.clear()
+        self._set_om_status("Modelfile を初期化しました", None)
+
+    def _start_om_create(self) -> None:
+        target_name = self.om_name_edit.text().strip()
+        err = om.validate_ollama_model_name(target_name)
+        if err:
+            self._set_om_status(_esc(err), self.c_red)
+            return
+
+        mf_content = self.om_modelfile_edit.toPlainText().strip()
+        if not mf_content:
+            self._set_om_status("Modelfile が空です。内容を入力してください。", self.c_red)
+            return
+        if not any(line.strip().startswith("FROM ") for line in mf_content.splitlines()):
+            self._set_om_status("Modelfile に 'FROM <ベースモデル>' がありません。", self.c_red)
+            return
+
+        overwrite = self.om_overwrite_chk.isChecked()
+        if not overwrite:
+            existing = tools.ollama_model_names()
+            if existing and target_name.lower() in existing:
+                self._set_om_status(f"同名のモデル '{target_name}' が存在します（上書きに印を付けてください）", self.c_red)
+                return
+
+        self.om_run_btn.setEnabled(False)
+        self.om_cancel_btn.setEnabled(True)
+        self.om_progress.setValue(0)
+        self._set_om_status(f"モデル '{target_name}' を作成中...", None)
+        self.om_log.clear()
+
+        job = om.OllamaCreateJob(
+            name=target_name,
+            modelfile_content=mf_content,
+            overwrite=overwrite,
+            on_log=self.om_sig.log.emit,
+            on_progress=self.om_sig.progress.emit,
+        )
+        self.om_job = job
+
+        def work() -> None:
+            ok = job.run()
+            self.om_sig.finished.emit(ok)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _cancel_om_create(self) -> None:
+        if self.om_job:
+            self.om_job.cancel()
+            self._set_om_status("取り消し中...", self.c_amber)
+
+    def _append_om_log(self, text: str) -> None:
+        self.om_log.appendPlainText(text)
+
+    def _on_om_progress(self, frac: float, text: str) -> None:
+        self.om_progress.setValue(int(frac * 1000))
+        self._set_om_status(f"実行中 {frac:.0%}: {_esc(text)}", None)
+
+    def _on_om_finished(self, success: bool) -> None:
+        self.om_job = None
+        self.om_run_btn.setEnabled(True)
+        self.om_cancel_btn.setEnabled(False)
+        if success:
+            self.om_progress.setValue(1000)
+            target = self.om_name_edit.text().strip()
+            self._set_om_status(f"作成完了: {target} （実行: ollama run {target}）", None)
+            self._refresh_ollama_models()
+        else:
+            self.om_progress.setValue(0)
+            self._set_om_status("モデル作成に失敗しました（ログを確認してください）", self.c_red)
+
+    def _set_om_status(self, html: str, color: QColor | None) -> None:
+        if color is not None:
+            html = f'<span style="color:{color.name()}">{html}</span>'
+        self.om_status.setText(html)
+
     def closeEvent(self, e) -> None:  # noqa: N802
         if self.runner is not None:
             ans = QMessageBox.question(self, "実行中", "量子化を実行中です。取り消して閉じますか？")
@@ -621,6 +1033,12 @@ class MainWindow(QMainWindow):
                 e.ignore()
                 return
             self.runner.cancel()
+        if self.om_job is not None:
+            ans = QMessageBox.question(self, "実行中", "Ollama モデル作成を実行中です。取り消して閉じますか？")
+            if ans != QMessageBox.StandardButton.Yes:
+                e.ignore()
+                return
+            self.om_job.cancel()
         e.accept()
 
 

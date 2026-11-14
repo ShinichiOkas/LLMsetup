@@ -1,10 +1,14 @@
 # LLMQuant
 
 LLM を llama.cpp で GGUF に量子化し、そのまま Ollama に登録する GUI ツール。
+ダウンロード済みの Ollama モデルから Modelfile を作成・カスタマイズして新しいモデルを作成（`ollama create`）する機能も備えています。
 
 ベース（HF 形式のモデルフォルダ、または `.gguf`）を指定すると、作れる量子化の種類が
 サイズの目安・GPU に載るか・品質・注意と一緒に一覧で出る。印を付けて「量子化を実行」すると
 GGUF ができ、望めば `ollama create` まで済む。
+
+また、「Ollama モデル作成」タブでは、ダウンロード済みモデルから Modelfile を自動取得・直接編集、
+システムプロンプトやパラメータ（temperature, num_ctx 等）を設定してワンクリックで新規モデルを作成できます。
 
 ## 使い方
 
@@ -18,6 +22,8 @@ CLI でも同じことができる（GUI と同じ芯を使う）:
 ```
 .venv\Scripts\python -m llmquant inspect "D:\models\Qwen3-8B"
 .venv\Scripts\python -m llmquant run "D:\models\Qwen3-8B" -t Q4_K_M -t Q6_K --ollama
+.venv\Scripts\python -m llmquant ollama-list
+.venv\Scripts\python -m llmquant ollama-create qwen2.5:7b my-qwen:latest --system "あなたはアシスタントです" --param temperature=0.7
 .venv\Scripts\python -m llmquant doctor
 ```
 

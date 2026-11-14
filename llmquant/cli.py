@@ -111,6 +111,74 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     return 1 if st.missing else 0
 
 
+def cmd_ollama_list(a: argparse.Namespace) -> int:
+    models = tools.ollama_list_models(max_age=0.0)
+    if models is None:
+        print("エラー: Ollama のモデル一覧を取得できませんでした（ollama が起動しているか確認してください）", file=sys.stderr)
+        return 1
+    if not models:
+        print("ダウンロード済みの Ollama モデルはありません。")
+        return 0
+    print(f"{'NAME':<45} {'ID':<15} {'SIZE':<12} {'MODIFIED'}")
+    for m in models:
+        print(f"{m.name:<45} {m.id:<15} {m.size:<12} {m.modified}")
+    return 0
+
+
+def cmd_ollama_create(a: argparse.Namespace) -> int:
+    from . import ollama_modelfile as om
+
+    base_model = a.base
+    target_name = a.name
+
+    if a.modelfile:
+        mf_path = Path(a.modelfile)
+        if not mf_path.is_file():
+            print(f"エラー: 指定された Modelfile が見つかりません: {mf_path}", file=sys.stderr)
+            return 1
+        mf_text = mf_path.read_text(encoding="utf-8")
+    else:
+        show_raw = tools.ollama_show_modelfile(base_model) if not a.no_base_template else None
+        if show_raw:
+            cleaned = om.clean_show_modelfile(show_raw, base_model)
+            sec = om.parse_modelfile_sections(cleaned)
+            sys_text = a.system if a.system is not None else sec["system"]
+            params = sec["parameters"]
+            if a.param:
+                for p in a.param:
+                    if "=" in p:
+                        k, v = p.split("=", 1)
+                        params.append((k.strip(), v.strip()))
+            mf_text = om.build_modelfile(
+                from_model=base_model,
+                system=sys_text,
+                parameters=params,
+                template=sec["template"],
+                extra=sec["extra"],
+            )
+        else:
+            params = []
+            if a.param:
+                for p in a.param:
+                    if "=" in p:
+                        k, v = p.split("=", 1)
+                        params.append((k.strip(), v.strip()))
+            mf_text = om.build_modelfile(
+                from_model=base_model,
+                system=a.system or "",
+                parameters=params,
+            )
+
+    job = om.OllamaCreateJob(
+        name=target_name,
+        modelfile_content=mf_text,
+        overwrite=a.overwrite,
+        on_log=print,
+    )
+    ok = job.run()
+    return 0 if ok else 1
+
+
 def cmd_gui(a: argparse.Namespace) -> int:
     from .gui import run_gui
 
@@ -154,8 +222,22 @@ def main(argv: list[str] | None = None) -> int:
     d = sub.add_parser("doctor", help="ツールの有無を確かめる")
     d.set_defaults(func=cmd_doctor)
 
+    ol = sub.add_parser("ollama-list", help="Ollama のダウンロード済みモデル一覧を表示")
+    ol.set_defaults(func=cmd_ollama_list)
+
+    oc = sub.add_parser("ollama-create", help="Modelfile を作成して Ollama モデルを作成（Create）")
+    oc.add_argument("base", help="ベースとなるダウンロード済みモデル名（例: qwen2.5:7b）")
+    oc.add_argument("name", help="作成する新規モデル名（例: my-qwen:latest）")
+    oc.add_argument("--system", help="システムプロンプト (SYSTEM)")
+    oc.add_argument("--param", action="append", default=[], help="パラメータ（例: --param temperature=0.7）")
+    oc.add_argument("--modelfile", "-f", help="既存の Modelfile パスを直接指定する場合")
+    oc.add_argument("--no-base-template", action="store_true", help="ベースモデルの既存設定を引き継がない")
+    oc.add_argument("--overwrite", action="store_true", help="同名のモデルが存在する場合に上書きする")
+    oc.set_defaults(func=cmd_ollama_create)
+
     argv = sys.argv[1:] if argv is None else argv
-    if not argv or (argv[0] not in ("gui", "inspect", "run", "doctor", "-h", "--help")):
+    known_commands = ("gui", "inspect", "run", "doctor", "ollama-list", "ollama-create", "-h", "--help")
+    if not argv or (argv[0] not in known_commands):
         argv = ["gui", *argv]
     a = p.parse_args(argv)
     return a.func(a)
