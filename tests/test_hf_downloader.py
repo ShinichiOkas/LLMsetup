@@ -107,3 +107,102 @@ def test_human_speed():
     assert hfd.human_speed(1024) == "1 KB/s"
     assert hfd.human_speed(1024 * 1024 * 15.5) == "15.50 MB/s"
 
+
+def test_hf_download_xet_fallback_and_resume(tmp_path, monkeypatch):
+    import huggingface_hub
+    import huggingface_hub.constants as hf_const
+
+    local_dir = tmp_path / "model"
+    dl_cache = local_dir / ".cache" / "huggingface" / "download"
+    dl_cache.mkdir(parents=True)
+    (dl_cache / "abc.incomplete").write_bytes(b"x" * 400)
+    assert hfd.has_incomplete_cache(local_dir)
+
+    monkeypatch.setattr(hf_const, "HF_HUB_DISABLE_XET", False)
+    monkeypatch.setattr("llmquant.hf_downloader.inspect_hf_repo", lambda repo_id, token=None: hfd.HfRepoInfo(
+        repo_id=repo_id, is_valid=True, total_files=1, total_size_bytes=1000, file_sizes={"model.safetensors": 1000},
+    ))
+    monkeypatch.setattr("llmquant.tools.free_bytes", lambda p: 10 * 1024**3)
+
+    calls = {"n": 0}
+
+    def fake_snapshot_download(**kwargs):
+        calls["n"] += 1
+        tqdm_cls = kwargs.get("tqdm_class")
+        assert tqdm_cls is not None
+        if calls["n"] == 1:
+            raise RuntimeError("Task error: File reconstruction error: Internal Writer Error: Background writer channel closed")
+        assert hf_const.HF_HUB_DISABLE_XET is True
+        bar = tqdm_cls(desc="Downloading bytes", total=600, unit="B")
+        bar.update(300)
+        bar.close()
+        return str(local_dir)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+
+    logs = []
+    progress = []
+    job = hfd.HfDownloadJob(
+        repo_id="test/big-model",
+        local_dir=local_dir,
+        on_log=logs.append,
+        on_progress=lambda f, t: progress.append((f, t)),
+        log_file=tmp_path / "dl.log",
+        max_retries=2,
+    )
+    res = job.run()
+    assert res == local_dir
+    assert calls["n"] == 2
+    assert any("途中キャッシュを検出" in l for l in logs)
+    assert any("hf-xet エラーを検出" in l for l in logs)
+    assert progress and progress[-1][0] == 1.0
+
+
+def test_hf_download_disk_space_check(tmp_path, monkeypatch):
+    monkeypatch.setattr("llmquant.hf_downloader.inspect_hf_repo", lambda repo_id, token=None: hfd.HfRepoInfo(
+        repo_id=repo_id, is_valid=True, total_files=1, total_size_bytes=10_000_000, file_sizes={"model.safetensors": 10_000_000},
+    ))
+    monkeypatch.setattr("llmquant.tools.free_bytes", lambda p: 1000)
+
+    job = hfd.HfDownloadJob(
+        repo_id="test/big-model",
+        local_dir=tmp_path / "model",
+        log_file=tmp_path / "dl.log",
+    )
+    with pytest.raises(RuntimeError, match="空き容量が足りません"):
+        job.run()
+
+
+def test_hf_download_fatal_no_retry(tmp_path, monkeypatch):
+    import huggingface_hub
+    from huggingface_hub.utils import RepositoryNotFoundError
+
+    monkeypatch.setattr("llmquant.hf_downloader.inspect_hf_repo", lambda repo_id, token=None: hfd.HfRepoInfo(
+        repo_id=repo_id, is_valid=False, error_message="not found",
+    ))
+
+    class FakeResp:
+        status_code = 404
+        headers = {}
+        url = "https://huggingface.co/test/missing"
+        request = None
+
+    calls = {"n": 0}
+
+    def fake_snapshot_download(**kwargs):
+        calls["n"] += 1
+        raise RepositoryNotFoundError("not found", response=FakeResp())
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+
+    job = hfd.HfDownloadJob(
+        repo_id="test/missing",
+        local_dir=tmp_path / "model",
+        log_file=tmp_path / "dl.log",
+        max_retries=3,
+    )
+    with pytest.raises(RepositoryNotFoundError):
+        job.run()
+    assert calls["n"] == 1
+
+

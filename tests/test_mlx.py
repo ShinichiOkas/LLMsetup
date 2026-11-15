@@ -102,7 +102,9 @@ def test_mlx_pipeline_plan_and_checks(jp_dir: Path, monkeypatch):
     out_dir = jp_dir / "out"
     out_dir.mkdir()
     spec = JobSpec(base=b, targets=["MLX-4bit", "MLX-BF16"], out_dir=out_dir, target_format=catalog.FMT_MLX)
-    assert spec.output_path("MLX-4bit") == out_dir / output_mlx_dirname(b.stem, "MLX-4bit")
+    assert spec.output_path("MLX-4bit") == out_dir / "Tiny-Llama-MLX-4bit-g64"
+    assert spec.output_path("MLX-mxfp4") == out_dir / "Tiny-Llama-MLX-mxfp4-g32"
+    assert spec.output_path("MLX-BF16") == out_dir / "Tiny-Llama-MLX-BF16"
     assert check_outputs(spec) == []
 
     steps = plan(spec)

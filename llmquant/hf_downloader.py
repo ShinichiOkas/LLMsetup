@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import re
 import threading
@@ -121,12 +122,15 @@ class DownloadProgressTracker:
     def __init__(
         self,
         total_expected_bytes: int = 0,
+        resumed_bytes: int = 0,
         on_progress: Callable[[float, str], None] | None = None,
         on_log: Callable[[str], None] | None = None,
         log_file: Path | None = None,
     ) -> None:
         self.total_expected_bytes = total_expected_bytes
-        self.downloaded_bytes = 0
+        self.resumed_bytes = resumed_bytes
+        self.session_bytes = 0
+        self.downloaded_bytes = resumed_bytes
         self.current_file_name = ""
         self.current_file_bytes = 0
         self.current_file_total = 0
@@ -140,6 +144,11 @@ class DownloadProgressTracker:
 
         if self.log_file:
             self.log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    def reset_speed_clock(self) -> None:
+        with self._lock:
+            self.start_time = time.monotonic()
+            self.session_bytes = 0
 
     def log(self, msg: str) -> None:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -158,13 +167,19 @@ class DownloadProgressTracker:
             self.current_file_total = total_bytes
             self.current_file_bytes = initial_bytes
         sz_str = human_bytes(total_bytes) if total_bytes > 0 else "不明"
-        self.log(f"ダウンロード開始: {filename} ({sz_str})")
+        if initial_bytes > 0:
+            self.log(f"ダウンロード再開: {filename} ({human_bytes(initial_bytes)} / {sz_str})")
+        else:
+            self.log(f"ダウンロード開始: {filename} ({sz_str})")
 
     def on_bytes(self, n: int) -> None:
         with self._lock:
             if self.canceled:
                 raise InterruptedError("ダウンロードが取り消されました")
+            if n <= 0:
+                return
             self.current_file_bytes += n
+            self.session_bytes += n
             self.downloaded_bytes += n
 
             now = time.monotonic()
@@ -180,16 +195,17 @@ class DownloadProgressTracker:
 
     def _emit_progress(self, now: float) -> None:
         elapsed = max(now - self.start_time, 0.001)
-        speed = self.downloaded_bytes / elapsed
+        speed = self.session_bytes / elapsed
         speed_str = human_speed(speed)
 
         if self.total_expected_bytes > 0:
-            frac = min(1.0, max(0.0, self.downloaded_bytes / self.total_expected_bytes))
-            rem_bytes = max(0, self.total_expected_bytes - self.downloaded_bytes)
+            effective_total = max(self.total_expected_bytes, self.downloaded_bytes)
+            frac = min(1.0, max(0.0, self.downloaded_bytes / effective_total))
+            rem_bytes = max(0, effective_total - self.downloaded_bytes)
             eta_sec = rem_bytes / speed if speed > 0 else 0
             eta_str = f"残り約 {int(eta_sec // 60)}分{int(eta_sec % 60):02d}秒" if eta_sec > 60 else f"残り約 {int(eta_sec)}秒"
 
-            cur_str = f"{human_bytes(self.downloaded_bytes)} / {human_bytes(self.total_expected_bytes)}"
+            cur_str = f"{human_bytes(self.downloaded_bytes)} / {human_bytes(effective_total)}"
             text = f"{self.current_file_name}: {cur_str} ({frac:.1%})  |  {speed_str}  |  {eta_str}"
         elif self.current_file_total > 0:
             frac = min(1.0, max(0.0, self.current_file_bytes / self.current_file_total))
@@ -202,8 +218,58 @@ class DownloadProgressTracker:
         self.on_progress(frac, text)
 
 
+def _is_xet_error(exc: Exception) -> bool:
+    msg = f"{type(exc).__name__}: {exc}".lower()
+    return any(k in msg for k in ("xet", "internal writer error", "background writer", "file reconstruction error", "channel closed"))
+
+
+def _is_fatal_error(exc: Exception) -> bool:
+    if isinstance(exc, InterruptedError):
+        return True
+    if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+        return True
+    name = type(exc).__name__
+    if name in ("RepositoryNotFoundError", "GatedRepoError", "EntryNotFoundError"):
+        return True
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status in (401, 403, 404):
+        return True
+    return False
+
+
+def _estimate_existing_bytes(local_dir: Path, filename: str | None = None) -> int:
+    """Sums sizes of already downloaded files and .incomplete cache files in local_dir."""
+    if not local_dir.exists():
+        return 0
+    total = 0
+    if filename:
+        target = local_dir / filename
+        if target.is_file():
+            return target.stat().st_size
+    else:
+        for p in local_dir.rglob("*"):
+            if not p.is_file():
+                continue
+            if ".cache" in p.parts:
+                if p.name.endswith(".incomplete"):
+                    total += p.stat().st_size
+            else:
+                total += p.stat().st_size
+    if filename:
+        dl_cache = local_dir / ".cache" / "huggingface" / "download"
+        if dl_cache.is_dir():
+            for p in dl_cache.rglob("*.incomplete"):
+                total += p.stat().st_size
+    return total
+
+
+def has_incomplete_cache(local_dir: Path) -> bool:
+    dl_cache = Path(local_dir) / ".cache" / "huggingface" / "download"
+    return dl_cache.is_dir() and any(dl_cache.rglob("*.incomplete"))
+
+
 class HfDownloadJob:
-    """Downloads a HF repository or specific file with byte-level tracking, cancellation, and logs."""
+    """Downloads a HF repository or specific file with byte-level tracking, retry/XET fallback, cancellation, and logs."""
 
     def __init__(
         self,
@@ -216,6 +282,7 @@ class HfDownloadJob:
         on_log: Callable[[str], None] | None = None,
         on_progress: Callable[[float, str], None] | None = None,
         log_file: Path | None = None,
+        max_retries: int = 3,
     ) -> None:
         self.repo_id = repo_id
         self.local_dir = Path(local_dir)
@@ -226,6 +293,7 @@ class HfDownloadJob:
         self.on_log = on_log or (lambda msg: None)
         self.on_progress = on_progress or (lambda p, m: None)
         self.log_file = log_file or (Path("logs") / "hf_download.log")
+        self.max_retries = max_retries
         self.tracker: DownloadProgressTracker | None = None
         self._canceled = False
 
@@ -234,23 +302,43 @@ class HfDownloadJob:
         if self.tracker:
             self.tracker.canceled = True
 
+    def _sleep_cancelable(self, seconds: float) -> None:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if self._canceled:
+                raise InterruptedError("ダウンロードを取り消しました")
+            time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
+
     def run(self) -> Path:
-        """Executes the download. Guarantees clean exit and persistent logs."""
-        import huggingface_hub.file_download as fd
+        """Executes the download with automatic retry and XET->HTTP fallback."""
+        import huggingface_hub.constants as hf_const
         from huggingface_hub import hf_hub_download, snapshot_download
+        from huggingface_hub.utils import tqdm as hf_tqdm
 
         self.local_dir.mkdir(parents=True, exist_ok=True)
         info = inspect_hf_repo(self.repo_id, token=self.token)
 
         # Estimate expected total bytes
-        total_bytes = 0
         if self.filename:
             total_bytes = info.file_sizes.get(self.filename, 0)
         else:
             total_bytes = info.total_size_bytes
 
+        existing_bytes = _estimate_existing_bytes(self.local_dir, self.filename)
+        if total_bytes > 0:
+            resumed_bytes = min(existing_bytes, total_bytes)
+            remaining_bytes = max(0, total_bytes - resumed_bytes)
+            free = tools.free_bytes(self.local_dir)
+            if free is not None and remaining_bytes > free:
+                raise RuntimeError(
+                    f"保存先の空き容量が足りません（残り必要 約 {human_bytes(remaining_bytes)} / 空き {human_bytes(free)}）"
+                )
+        else:
+            resumed_bytes = existing_bytes
+
         tracker = DownloadProgressTracker(
             total_expected_bytes=total_bytes,
+            resumed_bytes=resumed_bytes,
             on_progress=self.on_progress,
             on_log=self.on_log,
             log_file=self.log_file,
@@ -264,76 +352,98 @@ class HfDownloadJob:
         tracker.log(f"保存先: {self.local_dir.resolve()}")
         if total_bytes > 0:
             tracker.log(f"予定ダウンロード総量: {human_bytes(total_bytes)}")
+        if resumed_bytes > 0:
+            tracker.log(f"既存ファイル / 途中キャッシュを検出: {human_bytes(resumed_bytes)}（続きから再開します）")
         tracker.log("--------------------------------------------------")
 
-        orig_get_progress_bar_context = fd._get_progress_bar_context
+        class GuiTqdm(hf_tqdm):
+            def __init__(self, *args, **kwargs):
+                self._bar_name = kwargs.get("name") or ""
+                super().__init__(*args, **kwargs)
+                desc = str(getattr(self, "desc", "") or "")
+                unit = str(getattr(self, "unit", "") or "")
+                self._is_byte_transfer = (
+                    unit == "B" and "reconstruct" not in desc.lower()
+                )
+                if self._is_byte_transfer:
+                    tracker.on_file_start(desc or (self._bar_name or "download"), int(self.total or 0), int(self.n or 0))
 
-        class ByteTqdmHook:
-            def __init__(self, desc: str, total: int | None, initial: int = 0):
-                self.desc = desc
-                self.total = total or 0
-                self.n = initial or 0
-                tracker.on_file_start(desc, self.total, self.n)
-
-            def update(self, n: int = 1):
-                tracker.on_bytes(n)
+            def update(self, n=1):
+                super().update(n)
+                if self._is_byte_transfer:
+                    tracker.on_bytes(int(n))
+                elif tracker.canceled:
+                    raise InterruptedError("ダウンロードが取り消されました")
 
             def close(self):
-                tracker.on_file_done()
+                if self._is_byte_transfer:
+                    tracker.on_file_done()
+                super().close()
 
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                self.close()
-
-        def custom_progress_bar_context(*args, **kwargs):
-            if kwargs.get("name") == "huggingface_hub.http_get":
-                return ByteTqdmHook(
-                    desc=kwargs.get("desc", ""),
-                    total=kwargs.get("total"),
-                    initial=kwargs.get("initial", 0),
-                )
-            return orig_get_progress_bar_context(*args, **kwargs)
-
-        fd._get_progress_bar_context = custom_progress_bar_context
         try:
-            if self.filename:
-                dest = hf_hub_download(
-                    repo_id=self.repo_id,
-                    filename=self.filename,
-                    local_dir=str(self.local_dir),
-                    token=self.token,
-                )
-                res_path = Path(dest)
-            else:
-                ignore = list(self.ignore_patterns or [])
-                if not self.allow_patterns and not self.ignore_patterns:
-                    ignore = ["*.onnx", "*.ot", "*.msgpack", "*.h5"]
+            attempts = self.max_retries + 1
+            for attempt in range(1, attempts + 1):
+                if self._canceled:
+                    raise InterruptedError("ダウンロードを取り消しました")
+                try:
+                    if self.filename:
+                        dest = hf_hub_download(
+                            repo_id=self.repo_id,
+                            filename=self.filename,
+                            local_dir=str(self.local_dir),
+                            token=self.token,
+                            tqdm_class=GuiTqdm,
+                        )
+                        res_path = Path(dest)
+                    else:
+                        ignore = list(self.ignore_patterns or [])
+                        if not self.allow_patterns and not self.ignore_patterns:
+                            ignore = ["*.onnx", "*.ot", "*.msgpack", "*.h5"]
 
-                dest = snapshot_download(
-                    repo_id=self.repo_id,
-                    local_dir=str(self.local_dir),
-                    token=self.token,
-                    allow_patterns=self.allow_patterns,
-                    ignore_patterns=ignore,
-                )
-                res_path = Path(dest)
+                        dest = snapshot_download(
+                            repo_id=self.repo_id,
+                            local_dir=str(self.local_dir),
+                            token=self.token,
+                            allow_patterns=self.allow_patterns,
+                            ignore_patterns=ignore,
+                            tqdm_class=GuiTqdm,
+                        )
+                        res_path = Path(dest)
 
-            if self._canceled:
-                tracker.log("[終了] ユーザーによって取り消されました")
-                raise InterruptedError("ダウンロードを取り消しました")
+                    if self._canceled:
+                        tracker.log("[終了] ユーザーによって取り消されました")
+                        raise InterruptedError("ダウンロードを取り消しました")
 
-            self.on_progress(1.0, f"ダウンロード完了 ({human_bytes(tracker.downloaded_bytes)})")
-            tracker.log(f"[終了] 正常完了: {res_path}")
-            return res_path
+                    self.on_progress(1.0, f"ダウンロード完了 ({human_bytes(tracker.downloaded_bytes)})")
+                    tracker.log(f"[終了] 正常完了: {res_path}")
+                    return res_path
+
+                except InterruptedError:
+                    raise
+                except Exception as e:
+                    if _is_fatal_error(e) or attempt >= attempts:
+                        tracker.log(f"[エラー終了] 失敗: {type(e).__name__}: {e}")
+                        raise
+                    if _is_xet_error(e) and not hf_const.HF_HUB_DISABLE_XET:
+                        os.environ["HF_HUB_DISABLE_XET"] = "1"
+                        hf_const.HF_HUB_DISABLE_XET = True
+                        tracker.log(
+                            f"[警告] hf-xet エラーを検出したため通常 HTTP ダウンロードに切り替えて再開します ({attempt}/{self.max_retries}): {e}"
+                        )
+                    else:
+                        wait_s = min(10, 2 * attempt)
+                        tracker.log(
+                            f"[警告] 一時エラーのため {wait_s} 秒後に続きから自動再試行します ({attempt}/{self.max_retries}): {type(e).__name__}: {e}"
+                        )
+                        self._sleep_cancelable(wait_s)
+                    # Recalculate resumed bytes from disk before retrying
+                    new_resumed = _estimate_existing_bytes(self.local_dir, self.filename)
+                    tracker.resumed_bytes = min(new_resumed, total_bytes) if total_bytes > 0 else new_resumed
+                    tracker.downloaded_bytes = tracker.resumed_bytes
+                    tracker.reset_speed_clock()
 
         except InterruptedError:
             tracker.log("[終了] ダウンロードを取り消しました")
             raise
-        except Exception as e:
-            tracker.log(f"[エラー終了] 失敗: {type(e).__name__}: {e}")
-            raise
         finally:
-            fd._get_progress_bar_context = orig_get_progress_bar_context
             tracker.log("==================================================\n")

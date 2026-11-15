@@ -262,6 +262,7 @@ class MainWindow(QMainWindow):
         # 3. output + 4. ollama
         g3 = QGroupBox("3. 出力")
         f3 = QFormLayout(g3)
+        f3.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         out_row = QHBoxLayout()
         self.out_edit = QLineEdit()
         self.out_edit.editingFinished.connect(self._on_out_dir_edited)
@@ -270,10 +271,12 @@ class MainWindow(QMainWindow):
         out_row.addWidget(self.out_edit, 1)
         out_row.addWidget(b_out)
         f3.addRow("出力フォルダ:", out_row)
+        self.files_title_label = QLabel("できるファイル:")
         self.files_label = QLabel("-")
         self.files_label.setWordWrap(True)
+        self.files_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
         self.files_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        f3.addRow("できるファイル:", self.files_label)
+        f3.addRow(self.files_title_label, self.files_label)
         chk_row = QHBoxLayout()
         self.overwrite_chk = QCheckBox("同名のファイル・Ollama モデルを上書きする")
         self.overwrite_chk.toggled.connect(self._update_plan)
@@ -682,6 +685,7 @@ class MainWindow(QMainWindow):
         is_mlx = self.target_format() == catalog.FMT_MLX
         for w in (self.imatrix_label, self.imatrix_edit, self.imatrix_btn, self.keep_inter_chk, self.ollama_group):
             w.setVisible(not is_mlx)
+        self.files_title_label.setText("できるフォルダ:" if is_mlx else "できるファイル:")
         self.table.setHorizontalHeaderLabels(["", "種類", "サイズ", "メモリ" if is_mlx else "GPU", "品質", "説明・注意"])
         self._refresh_tools()
         if self.base is not None:
@@ -703,7 +707,10 @@ class MainWindow(QMainWindow):
         if t:
             p = Path(t)
             return str(p.parent if p.is_file() else p)
-        return str(Path.home())
+        models_dir = Path("models").resolve()
+        if models_dir.is_dir():
+            return str(models_dir)
+        return str(Path.cwd())
 
     def _pick_dir(self) -> None:
         d = QFileDialog.getExistingDirectory(self, "HF 形式のモデルフォルダ", self._start_dir())
@@ -1447,9 +1454,15 @@ class MainWindow(QMainWindow):
 
             # Suggest local output directory
             clean_name = repo_id.replace("/", "_")
-            self.hf_out_edit.setText(str((Path("models") / clean_name).resolve()))
+            suggested_dir = (Path("models") / clean_name).resolve()
+            self.hf_out_edit.setText(str(suggested_dir))
 
-            self._set_hf_status(f"'{repo_id}' の情報を取得しました", None)
+            if hfd.has_incomplete_cache(suggested_dir):
+                self.hf_download_btn.setText("続きから再開")
+                self._set_hf_status(f"'{repo_id}' の情報を取得しました（途中のキャッシュあり：続きから再開できます）", None)
+            else:
+                self.hf_download_btn.setText("ダウンロード開始")
+                self._set_hf_status(f"'{repo_id}' の情報を取得しました", None)
 
         finally:
             self.hf_inspect_btn.setEnabled(True)
@@ -1534,12 +1547,19 @@ class MainWindow(QMainWindow):
             p = Path(str(dest_path))
             self.hf_downloaded_path = p
             self.hf_set_base_btn.setEnabled(True)
+            self.hf_download_btn.setText("ダウンロード開始")
             self._set_hf_status(f"ダウンロード完了: {p.name} （「このモデルを量子化ベースに設定」で直接量子化へ進めます）", None)
             self._append_hf_log(f"\n[完了] 保存先: {p}")
         else:
             self.hf_progress.setValue(0)
             is_cancel = isinstance(err, InterruptedError) or (err and "取り消し" in str(err))
             msg = "ダウンロードを取り消しました" if is_cancel else (str(err) if err else "不明なエラー")
+            out_dir = Path(self.hf_out_edit.text().strip() or ".")
+            if hfd.has_incomplete_cache(out_dir):
+                self.hf_download_btn.setText("続きから再開")
+                msg += "（ボタンを押すと続きから再開できます）"
+            else:
+                self.hf_download_btn.setText("ダウンロード開始")
             self._set_hf_status(f"{_esc(msg)}", self.c_amber if is_cancel else self.c_red)
             self._append_hf_log(f"\n[{'取り消し' if is_cancel else 'エラー'}] {msg}")
 

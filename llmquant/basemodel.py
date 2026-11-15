@@ -423,8 +423,17 @@ def output_filename(base_name: str, qtype: str) -> str:
 
 
 def output_mlx_dirname(base_name: str, qtype: str) -> str:
+    from . import catalog
+
     stem = re.sub(r'[\\/:*?"<>|]+', "-", base_name).strip() or "model"
-    return f"{strip_type_suffix(stem)}-{qtype}"
+    suffix = qtype
+    q = catalog.MLX_BY_NAME.get(qtype.upper())
+    if q and q.mlx_bits and q.mlx_group_size:
+        if q.mlx_mode != "affine":
+            suffix = f"MLX-{q.mlx_mode}-g{q.mlx_group_size}"
+        else:
+            suffix = f"MLX-{q.mlx_bits}bit-g{q.mlx_group_size}"
+    return f"{strip_type_suffix(stem)}-{suffix}"
 
 
 __all__ = [
