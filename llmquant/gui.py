@@ -1462,9 +1462,10 @@ class MainWindow(QMainWindow):
             self._append_hf_log(f"\n[完了] 保存先: {p}")
         else:
             self.hf_progress.setValue(0)
-            msg = str(err) if err else "不明なエラー"
-            self._set_hf_status(f"ダウンロード失敗: {_esc(msg)}", self.c_red)
-            self._append_hf_log(f"\n[エラー] {msg}")
+            is_cancel = isinstance(err, InterruptedError) or (err and "取り消し" in str(err))
+            msg = "ダウンロードを取り消しました" if is_cancel else (str(err) if err else "不明なエラー")
+            self._set_hf_status(f"{_esc(msg)}", self.c_amber if is_cancel else self.c_red)
+            self._append_hf_log(f"\n[{'取り消し' if is_cancel else 'エラー'}] {msg}")
 
     def _set_downloaded_as_base(self) -> None:
         if not self.hf_downloaded_path or not self.hf_downloaded_path.exists():

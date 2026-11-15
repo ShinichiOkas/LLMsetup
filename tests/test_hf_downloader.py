@@ -67,3 +67,43 @@ def test_inspect_hf_repo_mock(monkeypatch):
     assert "model-Q4_K_M.gguf" in info.gguf_files
     assert info.total_files == 4
     assert info.file_sizes["config.json"] == 500
+
+
+def test_download_progress_tracker(tmp_path):
+    log_file = tmp_path / "logs" / "test_download.log"
+    logs_received = []
+    progress_updates = []
+
+    tracker = hfd.DownloadProgressTracker(
+        total_expected_bytes=1000,
+        on_progress=lambda f, t: progress_updates.append((f, t)),
+        on_log=lambda t: logs_received.append(t),
+        log_file=log_file,
+    )
+
+    tracker.log("初期化完了")
+    assert len(logs_received) == 1
+    assert "初期化完了" in logs_received[0]
+    assert log_file.exists()
+    assert "初期化完了" in log_file.read_text(encoding="utf-8")
+
+    tracker.on_file_start("model.safetensors", 1000)
+    assert len(logs_received) == 2
+    assert "ダウンロード開始: model.safetensors" in logs_received[1]
+
+    # バイト進捗
+    tracker.on_bytes(500)
+    assert tracker.downloaded_bytes == 500
+    assert tracker.current_file_bytes == 500
+
+    # キャンセル時の例外送出
+    tracker.canceled = True
+    with pytest.raises(InterruptedError):
+        tracker.on_bytes(100)
+
+
+def test_human_speed():
+    assert hfd.human_speed(0) == "0 B/s"
+    assert hfd.human_speed(1024) == "1 KB/s"
+    assert hfd.human_speed(1024 * 1024 * 15.5) == "15.50 MB/s"
+
