@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__, catalog, tools
+from . import benchmark as bm
 from . import chat_engine as ce
 from . import hf_downloader as hfd
 from . import ollama_modelfile as om
@@ -89,6 +90,12 @@ class _ChatSignals(QObject):
     chunk = Signal(str)
     status = Signal(str)
     finished = Signal(object, object)  # ChatMetrics | None, error
+
+
+class _BenchSignals(QObject):
+    log = Signal(str)
+    run_done = Signal(object)  # bm.BenchmarkRun
+    finished = Signal(object, object)  # list[bm.BenchmarkRun] | None, error
 
 
 class MainWindow(QMainWindow):
@@ -140,6 +147,18 @@ class MainWindow(QMainWindow):
         self.chat_sig.status.connect(self._on_chat_status)
         self.chat_sig.finished.connect(self._on_chat_finished)
 
+        # Benchmark tab state
+        self.bench_store = bm.BenchmarkStore()
+        self.bench_runs: list[bm.BenchmarkRun] = []
+        self.bench_custom_mlx: list[Path] = []
+        self.bench_cancel: threading.Event | None = None
+        self.bench_running = False
+        self._bench_initialized = False
+        self.bench_sig = _BenchSignals()
+        self.bench_sig.log.connect(self._append_bench_log)
+        self.bench_sig.run_done.connect(self._on_bench_run_done)
+        self.bench_sig.finished.connect(self._on_bench_finished)
+
         self._build()
         self.setAcceptDrops(True)
         self._refresh_tools()
@@ -171,6 +190,9 @@ class MainWindow(QMainWindow):
 
         chat_widget = self._build_chat_tab()
         self.tabs.addTab(chat_widget, "チャット")
+
+        bench_widget = self._build_bench_tab()
+        self.tabs.addTab(bench_widget, "ベンチマーク")
 
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.setCentralWidget(central)
@@ -802,6 +824,229 @@ class MainWindow(QMainWindow):
         self._on_chat_backend_changed()
         return w
 
+    def _build_bench_tab(self) -> QWidget:
+        w = QWidget()
+        root = QVBoxLayout(w)
+        root.setContentsMargins(4, 4, 4, 4)
+        root.setSpacing(6)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        root.addWidget(splitter, 1)
+
+        # Left pane: Targets + Categories + Sweep Params + Run controls
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(2, 2, 2, 2)
+        ll.setSpacing(6)
+
+        g_tgt = QGroupBox("1. 測定対象モデル（複数選択で横断比較）")
+        lt = QVBoxLayout(g_tgt)
+        t_btns = QHBoxLayout()
+        self.bench_refresh_btn = QPushButton("一覧を更新")
+        self.bench_refresh_btn.clicked.connect(self._refresh_bench_targets)
+        self.bench_add_mlx_btn = QPushButton("MLXフォルダ追加…")
+        self.bench_add_mlx_btn.clicked.connect(self._add_bench_mlx_dir)
+        self.bench_sel_all_btn = QPushButton("全選択")
+        self.bench_sel_all_btn.clicked.connect(lambda: self._set_bench_all_checked(True))
+        self.bench_sel_none_btn = QPushButton("解除")
+        self.bench_sel_none_btn.clicked.connect(lambda: self._set_bench_all_checked(False))
+        t_btns.addWidget(self.bench_refresh_btn)
+        t_btns.addWidget(self.bench_add_mlx_btn)
+        t_btns.addStretch(1)
+        t_btns.addWidget(self.bench_sel_all_btn)
+        t_btns.addWidget(self.bench_sel_none_btn)
+        lt.addLayout(t_btns)
+
+        self.bench_target_table = QTableWidget(0, 3)
+        self.bench_target_table.setHorizontalHeaderLabels(["", "基盤", "モデル"])
+        self.bench_target_table.verticalHeader().hide()
+        self.bench_target_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.bench_target_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        th = self.bench_target_table.horizontalHeader()
+        th.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        th.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        th.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.bench_target_table.setColumnWidth(0, 30)
+        self.bench_target_table.verticalHeader().setDefaultSectionSize(24)
+        lt.addWidget(self.bench_target_table, 1)
+        ll.addWidget(g_tgt, 1)
+
+        g_cat = QGroupBox("2. 測定カテゴリ")
+        lc = QGridLayout(g_cat)
+        self.bench_cat_checks: dict[str, QCheckBox] = {}
+        cat_defs = [
+            (bm.CATEGORY_BASIC, "基礎速度 (読込 / TTFT / tok/s)"),
+            (bm.CATEGORY_QA, "質問応答精度 (計算 / 論理 / JSON / コード)"),
+            (bm.CATEGORY_TOOL_CALL, "ツールコール精度 (関数・引数検証)"),
+            (bm.CATEGORY_VISION, "画像理解精度 (VLM: Ollama対応)"),
+        ]
+        for idx, (key, label) in enumerate(cat_defs):
+            chk = QCheckBox(label)
+            chk.setChecked(True)
+            self.bench_cat_checks[key] = chk
+            lc.addWidget(chk, idx // 2, idx % 2)
+        ll.addWidget(g_cat)
+
+        g_prm = QGroupBox("3. パラメータスイープ設定（カンマ区切りで複数指定可）")
+        lp = QFormLayout(g_prm)
+        self.bench_temp_edit = QLineEdit("0.0, 0.7")
+        self.bench_temp_edit.setPlaceholderText("例: 0.0, 0.3, 0.7")
+        self.bench_topp_edit = QLineEdit("0.95")
+        self.bench_topp_edit.setPlaceholderText("例: 0.9, 0.95")
+        self.bench_maxtok_edit = QLineEdit("512")
+        self.bench_maxtok_edit.setPlaceholderText("例: 256, 512")
+
+        cust_row = QHBoxLayout()
+        self.bench_custom_edit = QLineEdit()
+        self.bench_custom_edit.setPlaceholderText("（任意）カスタム問題 JSON / JSONL")
+        self.bench_custom_btn = QPushButton("選ぶ…")
+        self.bench_custom_btn.clicked.connect(self._pick_bench_custom_file)
+        cust_row.addWidget(self.bench_custom_edit, 1)
+        cust_row.addWidget(self.bench_custom_btn)
+
+        lp.addRow("temperature:", self.bench_temp_edit)
+        lp.addRow("top_p:", self.bench_topp_edit)
+        lp.addRow("max_tokens:", self.bench_maxtok_edit)
+        lp.addRow("追加問題:", cust_row)
+        ll.addWidget(g_prm)
+
+        run_row = QHBoxLayout()
+        self.bench_run_btn = QPushButton("ベンチマーク実行")
+        self.bench_run_btn.clicked.connect(self._start_bench)
+        self.bench_stop_btn = QPushButton("停止")
+        self.bench_stop_btn.setEnabled(False)
+        self.bench_stop_btn.clicked.connect(self._stop_bench)
+        run_row.addWidget(self.bench_run_btn, 1)
+        run_row.addWidget(self.bench_stop_btn)
+        ll.addLayout(run_row)
+
+        self.bench_status = QLabel("待機中")
+        self.bench_status.setWordWrap(True)
+        ll.addWidget(self.bench_status)
+
+        splitter.addWidget(left)
+
+        # Right pane: Ranking / Compare / Log & Detail
+        right_tabs = QTabWidget()
+        self.bench_subtabs = right_tabs
+
+        # Subtab 1: Ranking
+        w_rank = QWidget()
+        lr = QVBoxLayout(w_rank)
+        rk_ctrl = QHBoxLayout()
+        rk_ctrl.addWidget(QLabel("表示:"))
+        self.bench_filter_combo = QComboBox()
+        self.bench_filter_combo.addItem("すべて", "")
+        self.bench_filter_combo.addItem("MLX のみ", "mlx")
+        self.bench_filter_combo.addItem("Ollama のみ", "ollama")
+        self.bench_filter_combo.currentIndexChanged.connect(self._refresh_bench_ranking)
+        rk_ctrl.addWidget(self.bench_filter_combo)
+
+        rk_ctrl.addWidget(QLabel("並び順:"))
+        self.bench_sort_combo = QComboBox()
+        self.bench_sort_combo.addItem("総合スコア順", "overall_score")
+        self.bench_sort_combo.addItem("応答速度 (tok/s)", "avg_tps")
+        self.bench_sort_combo.addItem("読込時間 (速い順)", "load_time_s")
+        self.bench_sort_combo.addItem("TTFT (速い順)", "avg_ttft_s")
+        self.bench_sort_combo.addItem("質問応答精度", bm.CATEGORY_QA)
+        self.bench_sort_combo.addItem("ツールコール精度", bm.CATEGORY_TOOL_CALL)
+        self.bench_sort_combo.addItem("画像理解精度", bm.CATEGORY_VISION)
+        self.bench_sort_combo.currentIndexChanged.connect(self._refresh_bench_ranking)
+        rk_ctrl.addWidget(self.bench_sort_combo)
+        rk_ctrl.addStretch(1)
+
+        self.bench_export_btn = QPushButton("CSV保存…")
+        self.bench_export_btn.clicked.connect(self._export_bench_csv)
+        self.bench_del_btn = QPushButton("選択削除")
+        self.bench_del_btn.clicked.connect(self._delete_selected_bench_run)
+        self.bench_clear_hist_btn = QPushButton("履歴全消去")
+        self.bench_clear_hist_btn.clicked.connect(self._clear_bench_history)
+        rk_ctrl.addWidget(self.bench_export_btn)
+        rk_ctrl.addWidget(self.bench_del_btn)
+        rk_ctrl.addWidget(self.bench_clear_hist_btn)
+        lr.addLayout(rk_ctrl)
+
+        self.bench_rank_table = QTableWidget(0, 11)
+        self.bench_rank_table.setHorizontalHeaderLabels([
+            "順位", "日時", "基盤", "モデル", "パラメータ",
+            "総合%", "読込s", "TTFTs", "tok/s", "QA%", "Tool/Vis%"
+        ])
+        self.bench_rank_table.verticalHeader().hide()
+        self.bench_rank_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.bench_rank_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.bench_rank_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.bench_rank_table.itemSelectionChanged.connect(self._on_bench_rank_selected)
+        rhh = self.bench_rank_table.horizontalHeader()
+        for col in range(11):
+            rhh.setSectionResizeMode(
+                col,
+                QHeaderView.ResizeMode.Stretch if col in (3, 4) else QHeaderView.ResizeMode.ResizeToContents,
+            )
+        lr.addWidget(self.bench_rank_table, 1)
+        right_tabs.addTab(w_rank, "ランキング")
+
+        # Subtab 2: Compare
+        w_cmp = QWidget()
+        lcmp = QVBoxLayout(w_cmp)
+        cmp_row = QHBoxLayout()
+        cmp_row.addWidget(QLabel("基準 (A):"))
+        self.bench_cmp_a_combo = QComboBox()
+        self.bench_cmp_a_combo.currentIndexChanged.connect(self._update_bench_comparison)
+        cmp_row.addWidget(self.bench_cmp_a_combo, 1)
+        cmp_row.addWidget(QLabel("比較 (B):"))
+        self.bench_cmp_b_combo = QComboBox()
+        self.bench_cmp_b_combo.currentIndexChanged.connect(self._update_bench_comparison)
+        cmp_row.addWidget(self.bench_cmp_b_combo, 1)
+        lcmp.addLayout(cmp_row)
+
+        self.bench_cmp_summary_table = QTableWidget(0, 4)
+        self.bench_cmp_summary_table.setHorizontalHeaderLabels(["指標", "基準 (A)", "比較 (B)", "差分 (B - A)"])
+        self.bench_cmp_summary_table.verticalHeader().hide()
+        self.bench_cmp_summary_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        csh = self.bench_cmp_summary_table.horizontalHeader()
+        for col in range(4):
+            csh.setSectionResizeMode(col, QHeaderView.ResizeMode.Stretch)
+        lcmp.addWidget(self.bench_cmp_summary_table, 1)
+
+        self.bench_cmp_case_table = QTableWidget(0, 6)
+        self.bench_cmp_case_table.setHorizontalHeaderLabels(["ケース", "カテゴリ", "A 判定", "B 判定", "A tok/s", "B tok/s"])
+        self.bench_cmp_case_table.verticalHeader().hide()
+        self.bench_cmp_case_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        cch = self.bench_cmp_case_table.horizontalHeader()
+        for col in range(6):
+            cch.setSectionResizeMode(
+                col,
+                QHeaderView.ResizeMode.Stretch if col == 0 else QHeaderView.ResizeMode.ResizeToContents,
+            )
+        lcmp.addWidget(self.bench_cmp_case_table, 1)
+        right_tabs.addTab(w_cmp, "過去比較")
+
+        # Subtab 3: Log & Case Details
+        w_log = QWidget()
+        llog = QVBoxLayout(w_log)
+        self.bench_detail_table = QTableWidget(0, 6)
+        self.bench_detail_table.setHorizontalHeaderLabels(["ケース", "カテゴリ", "判定", "tok/s", "TTFTs", "理由 / 詳細"])
+        self.bench_detail_table.verticalHeader().hide()
+        self.bench_detail_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        dhh = self.bench_detail_table.horizontalHeader()
+        for col in range(6):
+            dhh.setSectionResizeMode(
+                col,
+                QHeaderView.ResizeMode.Stretch if col == 5 else QHeaderView.ResizeMode.ResizeToContents,
+            )
+        llog.addWidget(self.bench_detail_table, 1)
+
+        self.bench_log = QPlainTextEdit()
+        self.bench_log.setReadOnly(True)
+        self.bench_log.setMaximumHeight(180)
+        self.bench_log.setPlaceholderText("ベンチマーク実行ログがここに表示されます...")
+        llog.addWidget(self.bench_log)
+        right_tabs.addTab(w_log, "詳細・ログ")
+
+        splitter.addWidget(right_tabs)
+        splitter.setSizes([430, 780])
+        return w
+
     def _on_tab_changed(self, index: int) -> None:
         if index == 1 and not self._om_initialized:
             self._refresh_ollama_models()
@@ -809,6 +1054,10 @@ class MainWindow(QMainWindow):
         elif index == 3 and not self._chat_initialized:
             self._refresh_chat_models()
             self._chat_initialized = True
+        elif index == 4 and not self._bench_initialized:
+            self._refresh_bench_targets()
+            self._reload_bench_history()
+            self._bench_initialized = True
 
         vram = tools.gpu_vram_bytes()
         self.info_labels["GPU"].setText(f"VRAM {human_bytes(vram)}" if vram else "（検出なし）")
@@ -1733,6 +1982,8 @@ class MainWindow(QMainWindow):
                 e.ignore()
                 return
             self.hf_job.cancel()
+        if self.bench_cancel is not None:
+            self.bench_cancel.set()
         if self.chat_cancel is not None:
             self.chat_cancel.set()
         self.chat_session.unload()
@@ -1917,6 +2168,322 @@ class MainWindow(QMainWindow):
             self.chat_status.setText(f"生成完了: {metrics.tokens} tokens{tps_str} / {metrics.elapsed:.1f}s")
         else:
             self.chat_status.setText("完了")
+
+    # ------------------------------------------------------------ Benchmark tab
+    def _refresh_bench_targets(self) -> None:
+        self.bench_target_table.setRowCount(0)
+        targets: list[bm.BenchmarkTarget] = []
+
+        if tools.is_apple_silicon() and tools.mlx_lm_available():
+            seen_paths: set[Path] = set()
+            for p in ce.list_local_mlx_models() + self.bench_custom_mlx:
+                rp = p.resolve()
+                if rp not in seen_paths and rp.is_dir():
+                    seen_paths.add(rp)
+                    targets.append(bm.BenchmarkTarget(backend="mlx", model_id=str(rp), model_name=rp.name))
+
+        for m in tools.ollama_list_models():
+            targets.append(bm.BenchmarkTarget(backend="ollama", model_id=m.name, model_name=m.name))
+
+        for row, t in enumerate(targets):
+            self.bench_target_table.insertRow(row)
+            chk = QTableWidgetItem()
+            chk.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+            chk.setCheckState(Qt.CheckState.Checked if row == 0 else Qt.CheckState.Unchecked)
+            chk.setData(Qt.ItemDataRole.UserRole, t)
+            self.bench_target_table.setItem(row, 0, chk)
+            self.bench_target_table.setItem(row, 1, QTableWidgetItem(t.backend.upper()))
+            name_item = QTableWidgetItem(t.model_name)
+            name_item.setToolTip(t.model_id)
+            self.bench_target_table.setItem(row, 2, name_item)
+
+    def _add_bench_mlx_dir(self) -> None:
+        start = str(Path("models").resolve()) if Path("models").is_dir() else str(Path.home())
+        d = QFileDialog.getExistingDirectory(self, "MLX モデルフォルダを選択", start)
+        if d:
+            p = Path(d).resolve()
+            if p not in self.bench_custom_mlx:
+                self.bench_custom_mlx.append(p)
+            self._refresh_bench_targets()
+
+    def _set_bench_all_checked(self, checked: bool) -> None:
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        for r in range(self.bench_target_table.rowCount()):
+            it = self.bench_target_table.item(r, 0)
+            if it is not None:
+                it.setCheckState(state)
+
+    def _pick_bench_custom_file(self) -> None:
+        p, _ = QFileDialog.getOpenFileName(
+            self, "カスタムベンチマーク問題を選択", "", "JSON / JSONL (*.json *.jsonl)"
+        )
+        if p:
+            self.bench_custom_edit.setText(p)
+
+    def _selected_bench_targets(self) -> list[bm.BenchmarkTarget]:
+        out: list[bm.BenchmarkTarget] = []
+        for r in range(self.bench_target_table.rowCount()):
+            it = self.bench_target_table.item(r, 0)
+            if it is not None and it.checkState() == Qt.CheckState.Checked:
+                t = it.data(Qt.ItemDataRole.UserRole)
+                if isinstance(t, bm.BenchmarkTarget):
+                    out.append(t)
+        return out
+
+    def _start_bench(self) -> None:
+        if self.bench_running:
+            return
+        targets = self._selected_bench_targets()
+        if not targets:
+            self.bench_status.setText("測定対象モデルを1つ以上選択してください")
+            return
+
+        categories = [k for k, chk in self.bench_cat_checks.items() if chk.isChecked()]
+        if not categories:
+            self.bench_status.setText("測定カテゴリを1つ以上選択してください")
+            return
+
+        try:
+            temps = bm.parse_number_list(self.bench_temp_edit.text(), as_int=False, default=[0.0])
+            tops = bm.parse_number_list(self.bench_topp_edit.text(), as_int=False, default=[0.95])
+            maxs = bm.parse_number_list(self.bench_maxtok_edit.text(), as_int=True, default=[512])
+        except ValueError as e:
+            self.bench_status.setText(f"パラメータ形式エラー: {e}")
+            return
+
+        custom_cases: list[bm.BenchmarkCase] = []
+        custom_path_str = self.bench_custom_edit.text().strip()
+        if custom_path_str:
+            try:
+                custom_cases = bm.load_custom_cases(Path(custom_path_str))
+            except Exception as e:
+                self.bench_status.setText(f"追加問題読み込みエラー: {e}")
+                return
+
+        param_grid = bm.expand_sweep_configs(temps, tops, maxs)
+        cancel_ev = threading.Event()
+        self.bench_cancel = cancel_ev
+        self.bench_running = True
+        self.bench_run_btn.setEnabled(False)
+        self.bench_stop_btn.setEnabled(True)
+        self.bench_log.clear()
+        self.bench_status.setText(
+            f"測定開始: {len(targets)}モデル × {len(param_grid)}パラメータ = {len(targets) * len(param_grid)}ジョブ"
+        )
+
+        def work() -> None:
+            try:
+                runs = bm.run_benchmark_sweep(
+                    targets=targets,
+                    categories=categories,
+                    param_grid=param_grid,
+                    custom_cases=custom_cases,
+                    cancel_event=cancel_ev,
+                    on_progress=self.bench_sig.log.emit,
+                    on_run_done=self.bench_sig.run_done.emit,
+                )
+                self.bench_sig.finished.emit(runs, None)
+            except BaseException as e:
+                self.bench_sig.finished.emit(None, e)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _stop_bench(self) -> None:
+        if self.bench_cancel is not None:
+            self.bench_cancel.set()
+            self.bench_status.setText("停止を要求しました...")
+            self.bench_stop_btn.setEnabled(False)
+
+    def _append_bench_log(self, line: str) -> None:
+        self.bench_log.appendPlainText(line)
+        self.bench_status.setText(line)
+
+    def _on_bench_run_done(self, run: object) -> None:
+        if isinstance(run, bm.BenchmarkRun):
+            self.bench_store.append(run)
+            self._reload_bench_history()
+            self._populate_bench_details(run)
+
+    def _on_bench_finished(self, runs: object, err: object) -> None:
+        was_canceled = bool(self.bench_cancel and self.bench_cancel.is_set())
+        self.bench_running = False
+        self.bench_cancel = None
+        self.bench_run_btn.setEnabled(True)
+        self.bench_stop_btn.setEnabled(False)
+        if err is not None:
+            self._append_bench_log(f"[エラー] {err}")
+            self.bench_status.setText(f"エラー: {err}")
+        elif was_canceled:
+            self.bench_status.setText("ベンチマークを停止しました")
+        else:
+            cnt = len(runs) if isinstance(runs, list) else 0
+            self.bench_status.setText(f"ベンチマーク完了（{cnt}件を記録しました）")
+
+    def _reload_bench_history(self) -> None:
+        self.bench_runs = self.bench_store.load_all()
+        self._refresh_bench_ranking()
+        self._refresh_bench_compare_combos()
+
+    def _refresh_bench_ranking(self) -> None:
+        backend_flt = self.bench_filter_combo.currentData() or None
+        sort_by = self.bench_sort_combo.currentData() or "overall_score"
+        ranked = bm.rank_runs(self.bench_runs, sort_by=sort_by, backend_filter=backend_flt)
+
+        self.bench_rank_table.setRowCount(0)
+        for idx, r in enumerate(ranked, 1):
+            row = self.bench_rank_table.rowCount()
+            self.bench_rank_table.insertRow(row)
+            prm = r.params or {}
+            prm_str = f"t={prm.get('temperature', '-')}, p={prm.get('top_p', '-')}, max={prm.get('max_tokens', '-')}"
+            qa_s = r.category_scores.get(bm.CATEGORY_QA)
+            tl_s = r.category_scores.get(bm.CATEGORY_TOOL_CALL)
+            vs_s = r.category_scores.get(bm.CATEGORY_VISION)
+            tv_str = f"{tl_s:.0f}" if tl_s is not None else "-"
+            tv_str += " / " + (f"{vs_s:.0f}" if vs_s is not None else "-")
+
+            vals = [
+                str(idx),
+                r.timestamp[:19].replace("T", " "),
+                r.backend.upper(),
+                r.model_name,
+                prm_str,
+                f"{r.overall_score:.1f}" if r.overall_score is not None else "-",
+                f"{r.load_time_s:.2f}" if r.load_time_s is not None else "-",
+                f"{r.avg_ttft_s:.2f}" if r.avg_ttft_s is not None else "-",
+                f"{r.avg_tps:.1f}" if r.avg_tps is not None else "-",
+                f"{qa_s:.0f}" if qa_s is not None else "-",
+                tv_str,
+            ]
+            for col, text in enumerate(vals):
+                item = QTableWidgetItem(text)
+                if col == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, r.run_id)
+                self.bench_rank_table.setItem(row, col, item)
+
+    def _on_bench_rank_selected(self) -> None:
+        row = self.bench_rank_table.currentRow()
+        if row < 0:
+            return
+        it = self.bench_rank_table.item(row, 0)
+        if it is None:
+            return
+        rid = it.data(Qt.ItemDataRole.UserRole)
+        run = next((r for r in self.bench_runs if r.run_id == rid), None)
+        if run is not None:
+            self._populate_bench_details(run)
+
+    def _populate_bench_details(self, run: bm.BenchmarkRun) -> None:
+        self.bench_detail_table.setRowCount(0)
+        for c in run.case_results:
+            row = self.bench_detail_table.rowCount()
+            self.bench_detail_table.insertRow(row)
+            status_str = "SKIP" if c.passed is None else ("PASS" if c.passed else "FAIL")
+            vals = [
+                c.title,
+                bm.CATEGORY_LABELS.get(c.category, c.category),
+                status_str,
+                f"{c.tps:.1f}" if c.tps is not None else "-",
+                f"{c.ttft_s:.2f}" if c.ttft_s is not None else "-",
+                c.reason,
+            ]
+            for col, text in enumerate(vals):
+                self.bench_detail_table.setItem(row, col, QTableWidgetItem(text))
+
+    def _refresh_bench_compare_combos(self) -> None:
+        cur_a = self.bench_cmp_a_combo.currentData()
+        cur_b = self.bench_cmp_b_combo.currentData()
+        self.bench_cmp_a_combo.blockSignals(True)
+        self.bench_cmp_b_combo.blockSignals(True)
+        self.bench_cmp_a_combo.clear()
+        self.bench_cmp_b_combo.clear()
+        for r in reversed(self.bench_runs):
+            label = (
+                f"[{r.backend.upper()}] {r.model_name} "
+                f"(t={r.params.get('temperature')}, {r.timestamp[5:16].replace('T', ' ')})"
+            )
+            self.bench_cmp_a_combo.addItem(label, r.run_id)
+            self.bench_cmp_b_combo.addItem(label, r.run_id)
+        if cur_a:
+            idx = self.bench_cmp_a_combo.findData(cur_a)
+            if idx >= 0:
+                self.bench_cmp_a_combo.setCurrentIndex(idx)
+        elif self.bench_cmp_a_combo.count() > 1:
+            self.bench_cmp_a_combo.setCurrentIndex(1)
+        if cur_b:
+            idx = self.bench_cmp_b_combo.findData(cur_b)
+            if idx >= 0:
+                self.bench_cmp_b_combo.setCurrentIndex(idx)
+        self.bench_cmp_a_combo.blockSignals(False)
+        self.bench_cmp_b_combo.blockSignals(False)
+        self._update_bench_comparison()
+
+    def _update_bench_comparison(self) -> None:
+        self.bench_cmp_summary_table.setRowCount(0)
+        self.bench_cmp_case_table.setRowCount(0)
+        id_a = self.bench_cmp_a_combo.currentData()
+        id_b = self.bench_cmp_b_combo.currentData()
+        run_a = next((r for r in self.bench_runs if r.run_id == id_a), None)
+        run_b = next((r for r in self.bench_runs if r.run_id == id_b), None)
+        if run_a is None or run_b is None:
+            return
+
+        cmp_data = bm.compare_runs(run_a, run_b)
+        labels = [
+            ("overall_score", "総合スコア (%)", ".1f"),
+            ("avg_tps", "平均速度 (tok/s)", ".1f"),
+            ("load_time_s", "モデル読込時間 (s)", ".2f"),
+            ("avg_ttft_s", "平均 TTFT (s)", ".2f"),
+            (f"score_{bm.CATEGORY_QA}", "質問応答精度 (%)", ".1f"),
+            (f"score_{bm.CATEGORY_TOOL_CALL}", "ツールコール精度 (%)", ".1f"),
+            (f"score_{bm.CATEGORY_VISION}", "画像理解精度 (%)", ".1f"),
+        ]
+        for key, label, fmt in labels:
+            va, vb, vd = cmp_data["summary"].get(key, (None, None, None))
+            row = self.bench_cmp_summary_table.rowCount()
+            self.bench_cmp_summary_table.insertRow(row)
+            self.bench_cmp_summary_table.setItem(row, 0, QTableWidgetItem(label))
+            self.bench_cmp_summary_table.setItem(row, 1, QTableWidgetItem(format(va, fmt) if va is not None else "-"))
+            self.bench_cmp_summary_table.setItem(row, 2, QTableWidgetItem(format(vb, fmt) if vb is not None else "-"))
+            d_str = f"{vd:+{fmt}}" if vd is not None else "-"
+            self.bench_cmp_summary_table.setItem(row, 3, QTableWidgetItem(d_str))
+
+        for c in cmp_data["cases"]:
+            row = self.bench_cmp_case_table.rowCount()
+            self.bench_cmp_case_table.insertRow(row)
+            def _fmt_p(p: bool | None) -> str:
+                return "-" if p is None else ("PASS" if p else "FAIL")
+            self.bench_cmp_case_table.setItem(row, 0, QTableWidgetItem(c["title"]))
+            self.bench_cmp_case_table.setItem(row, 1, QTableWidgetItem(bm.CATEGORY_LABELS.get(c["category"], c["category"])))
+            self.bench_cmp_case_table.setItem(row, 2, QTableWidgetItem(_fmt_p(c["a_passed"])))
+            self.bench_cmp_case_table.setItem(row, 3, QTableWidgetItem(_fmt_p(c["b_passed"])))
+            self.bench_cmp_case_table.setItem(row, 4, QTableWidgetItem(f"{c['a_tps']:.1f}" if c["a_tps"] is not None else "-"))
+            self.bench_cmp_case_table.setItem(row, 5, QTableWidgetItem(f"{c['b_tps']:.1f}" if c["b_tps"] is not None else "-"))
+
+    def _export_bench_csv(self) -> None:
+        p, _ = QFileDialog.getSaveFileName(self, "ベンチマーク結果をCSV保存", "benchmark_results.csv", "CSV (*.csv)")
+        if p:
+            self.bench_store.export_csv(Path(p), self.bench_runs)
+            self.bench_status.setText(f"CSV を保存しました: {p}")
+
+    def _delete_selected_bench_run(self) -> None:
+        row = self.bench_rank_table.currentRow()
+        if row < 0:
+            return
+        it = self.bench_rank_table.item(row, 0)
+        if it is None:
+            return
+        rid = it.data(Qt.ItemDataRole.UserRole)
+        if rid and self.bench_store.delete_run(rid):
+            self._reload_bench_history()
+            self.bench_status.setText("選択した記録を削除しました")
+
+    def _clear_bench_history(self) -> None:
+        ans = QMessageBox.question(self, "確認", "保存されているベンチマーク履歴をすべて削除しますか？")
+        if ans == QMessageBox.StandardButton.Yes:
+            self.bench_store.clear()
+            self._reload_bench_history()
+            self.bench_detail_table.setRowCount(0)
+            self.bench_status.setText("履歴をすべて削除しました")
 
 
 def _esc(s: str) -> str:

@@ -133,7 +133,7 @@ def test_gui_chat_tab_controls(monkeypatch):
     monkeypatch.setattr("llmquant.tools.ollama_list_models", lambda max_age=0.0: [])
 
     w = MainWindow()
-    assert w.tabs.count() == 4
+    assert w.tabs.count() == 5
     w.tabs.setCurrentIndex(3)
     w.chat_input.setPlainText("テストメッセージ")
     w._clear_chat()
