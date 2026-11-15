@@ -97,8 +97,9 @@ def test_gui_ollama_tab(app, monkeypatch):
     monkeypatch.setattr("llmquant.tools.ollama_show_modelfile", lambda name: f'FROM blob123\nSYSTEM You are an assistant.\nPARAMETER temperature 0.8\n')
 
     w = MainWindow()
-    assert w.tabs.count() == 3
+    assert w.tabs.count() == 4
     assert w.tabs.tabText(0) == "モデル量子化 (GGUF / MLX)"
+    assert w.tabs.tabText(3) == "チャット"
     assert w.tabs.tabText(1) == "Ollama モデル作成"
     assert w.tabs.tabText(2) == "HF ダウンロード"
 

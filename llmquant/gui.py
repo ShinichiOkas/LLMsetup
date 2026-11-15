@@ -6,13 +6,14 @@ import os
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QBrush, QColor, QFont, QGuiApplication, QPalette
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
+from PySide6.QtGui import QBrush, QColor, QFont, QGuiApplication, QPalette, QTextCursor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -30,6 +31,7 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QSplitter,
     QTabWidget,
     QTableWidget,
@@ -39,6 +41,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__, catalog, tools
+from . import chat_engine as ce
 from . import hf_downloader as hfd
 from . import ollama_modelfile as om
 from .basemodel import (
@@ -82,6 +85,12 @@ class _HfSignals(QObject):
     finished = Signal(object, object)  # dest_path, error
 
 
+class _ChatSignals(QObject):
+    chunk = Signal(str)
+    status = Signal(str)
+    finished = Signal(object, object)  # ChatMetrics | None, error
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -119,6 +128,18 @@ class MainWindow(QMainWindow):
         self.hf_sig.progress.connect(self._on_hf_progress)
         self.hf_sig.finished.connect(self._on_hf_finished)
 
+        # Chat tab state
+        self.chat_session = ce.MlxChatSession()
+        self.chat_history: list[dict[str, str]] = []
+        self.chat_cancel: threading.Event | None = None
+        self.chat_running = False
+        self._chat_initialized = False
+        self._chat_reply_buf: list[str] = []
+        self.chat_sig = _ChatSignals()
+        self.chat_sig.chunk.connect(self._on_chat_chunk)
+        self.chat_sig.status.connect(self._on_chat_status)
+        self.chat_sig.finished.connect(self._on_chat_finished)
+
         self._build()
         self.setAcceptDrops(True)
         self._refresh_tools()
@@ -147,6 +168,9 @@ class MainWindow(QMainWindow):
 
         hf_widget = self._build_hf_tab()
         self.tabs.addTab(hf_widget, "HF ダウンロード")
+
+        chat_widget = self._build_chat_tab()
+        self.tabs.addTab(chat_widget, "チャット")
 
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.setCentralWidget(central)
@@ -669,10 +693,122 @@ class MainWindow(QMainWindow):
 
         return w
 
+    def _build_chat_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(8)
+
+        # 1. Model & parameters
+        g1 = QGroupBox("1. モデル・設定")
+        l1 = QVBoxLayout(g1)
+
+        row_top = QHBoxLayout()
+        row_top.addWidget(QLabel("実行基盤:"))
+        self.chat_mlx_radio = QRadioButton("MLX (ローカル)")
+        self.chat_ollama_radio = QRadioButton("Ollama")
+        if tools.is_apple_silicon() and tools.mlx_lm_available():
+            self.chat_mlx_radio.setChecked(True)
+        else:
+            self.chat_mlx_radio.setEnabled(False)
+            self.chat_mlx_radio.setToolTip("MLX は Apple Silicon Mac (mlx-lm 導入済み) 専用です")
+            self.chat_ollama_radio.setChecked(True)
+        self.chat_mlx_radio.toggled.connect(self._on_chat_backend_changed)
+        row_top.addWidget(self.chat_mlx_radio)
+        row_top.addWidget(self.chat_ollama_radio)
+        row_top.addSpacing(12)
+
+        row_top.addWidget(QLabel("モデル:"))
+        self.chat_model_combo = QComboBox()
+        self.chat_model_combo.setEditable(True)
+        self.chat_model_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        row_top.addWidget(self.chat_model_combo, 1)
+
+        self.chat_refresh_btn = QPushButton("更新")
+        self.chat_refresh_btn.clicked.connect(self._refresh_chat_models)
+        self.chat_pick_btn = QPushButton("フォルダを選ぶ…")
+        self.chat_pick_btn.clicked.connect(self._pick_chat_mlx_dir)
+        self.chat_unload_btn = QPushButton("メモリ解放")
+        self.chat_unload_btn.setToolTip("ロード中の MLX モデルをメモリから解放します")
+        self.chat_unload_btn.clicked.connect(self._unload_chat_model)
+        row_top.addWidget(self.chat_refresh_btn)
+        row_top.addWidget(self.chat_pick_btn)
+        row_top.addWidget(self.chat_unload_btn)
+        l1.addLayout(row_top)
+
+        row_param = QHBoxLayout()
+        row_param.addWidget(QLabel("System:"))
+        self.chat_system_edit = QLineEdit()
+        self.chat_system_edit.setPlaceholderText("（任意）システムプロンプト（例: 日本語で簡潔に答えてください）")
+        row_param.addWidget(self.chat_system_edit, 1)
+
+        row_param.addSpacing(12)
+        row_param.addWidget(QLabel("Temp:"))
+        self.chat_temp_spin = QDoubleSpinBox()
+        self.chat_temp_spin.setRange(0.0, 2.0)
+        self.chat_temp_spin.setSingleStep(0.1)
+        self.chat_temp_spin.setValue(0.7)
+        row_param.addWidget(self.chat_temp_spin)
+
+        row_param.addWidget(QLabel("Max tokens:"))
+        self.chat_max_tok_spin = QSpinBox()
+        self.chat_max_tok_spin.setRange(64, 32768)
+        self.chat_max_tok_spin.setSingleStep(128)
+        self.chat_max_tok_spin.setValue(1024)
+        row_param.addWidget(self.chat_max_tok_spin)
+        l1.addLayout(row_param)
+        layout.addWidget(g1)
+
+        # 2. Conversation view
+        self.chat_view = QPlainTextEdit()
+        self.chat_view.setReadOnly(True)
+        self.chat_view.setPlaceholderText("ここに会話が表示されます")
+        layout.addWidget(self.chat_view, 1)
+
+        # 3. Input & controls
+        input_row = QHBoxLayout()
+        self.chat_input = QPlainTextEdit()
+        self.chat_input.setMaximumHeight(84)
+        self.chat_input.setPlaceholderText("メッセージを入力（Enter で送信 / Shift+Enter で改行）")
+        self.chat_input.installEventFilter(self)
+        input_row.addWidget(self.chat_input, 1)
+
+        btn_col = QVBoxLayout()
+        self.chat_send_btn = QPushButton("送信")
+        self.chat_send_btn.setMinimumHeight(32)
+        f = self.chat_send_btn.font()
+        f.setBold(True)
+        self.chat_send_btn.setFont(f)
+        self.chat_send_btn.clicked.connect(self._send_chat)
+
+        sub_row = QHBoxLayout()
+        self.chat_stop_btn = QPushButton("停止")
+        self.chat_stop_btn.setEnabled(False)
+        self.chat_stop_btn.clicked.connect(self._stop_chat)
+        self.chat_clear_btn = QPushButton("クリア")
+        self.chat_clear_btn.clicked.connect(self._clear_chat)
+        sub_row.addWidget(self.chat_stop_btn)
+        sub_row.addWidget(self.chat_clear_btn)
+
+        btn_col.addWidget(self.chat_send_btn)
+        btn_col.addLayout(sub_row)
+        input_row.addLayout(btn_col)
+        layout.addLayout(input_row)
+
+        self.chat_status = QLabel("モデルを選んでメッセージを送信してください")
+        self.chat_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.chat_status)
+
+        self._on_chat_backend_changed()
+        return w
+
     def _on_tab_changed(self, index: int) -> None:
         if index == 1 and not self._om_initialized:
             self._refresh_ollama_models()
             self._om_initialized = True
+        elif index == 3 and not self._chat_initialized:
+            self._refresh_chat_models()
+            self._chat_initialized = True
 
         vram = tools.gpu_vram_bytes()
         self.info_labels["GPU"].setText(f"VRAM {human_bytes(vram)}" if vram else "（検出なし）")
@@ -1597,7 +1733,190 @@ class MainWindow(QMainWindow):
                 e.ignore()
                 return
             self.hf_job.cancel()
+        if self.chat_cancel is not None:
+            self.chat_cancel.set()
+        self.chat_session.unload()
         e.accept()
+
+    # ------------------------------------------------------------ chat tab
+    def _chat_backend(self) -> str:
+        return "mlx" if self.chat_mlx_radio.isChecked() else "ollama"
+
+    def _on_chat_backend_changed(self) -> None:
+        is_mlx = self._chat_backend() == "mlx"
+        self.chat_pick_btn.setVisible(is_mlx)
+        self.chat_unload_btn.setVisible(is_mlx)
+        self._refresh_chat_models()
+
+    def _refresh_chat_models(self) -> None:
+        cur = self.chat_model_combo.currentData() or self.chat_model_combo.currentText().strip()
+        self.chat_model_combo.clear()
+        if self._chat_backend() == "mlx":
+            dirs = ce.list_local_mlx_models()
+            for d in dirs:
+                self.chat_model_combo.addItem(d.name, str(d))
+            if cur:
+                idx = self.chat_model_combo.findData(cur)
+                if idx >= 0:
+                    self.chat_model_combo.setCurrentIndex(idx)
+                elif Path(cur).is_dir():
+                    self.chat_model_combo.addItem(Path(cur).name, cur)
+                    self.chat_model_combo.setCurrentIndex(self.chat_model_combo.count() - 1)
+        else:
+            items = tools.ollama_list_models(max_age=0.0) or []
+            for m in items:
+                self.chat_model_combo.addItem(m.name, m.name)
+            if cur:
+                idx = self.chat_model_combo.findData(cur)
+                if idx >= 0:
+                    self.chat_model_combo.setCurrentIndex(idx)
+
+    def _pick_chat_mlx_dir(self) -> None:
+        d = QFileDialog.getExistingDirectory(self, "MLX モデルフォルダを選択", self._start_dir())
+        if not d:
+            return
+        resolved = str(Path(d).resolve())
+        idx = self.chat_model_combo.findData(resolved)
+        if idx < 0:
+            self.chat_model_combo.addItem(Path(resolved).name, resolved)
+            idx = self.chat_model_combo.count() - 1
+        self.chat_model_combo.setCurrentIndex(idx)
+
+    def _unload_chat_model(self) -> None:
+        if self.chat_running:
+            return
+        self.chat_session.unload()
+        self.chat_status.setText("MLX モデルをメモリから解放しました")
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if obj is getattr(self, "chat_input", None) and event.type() == QEvent.Type.KeyPress:
+            if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not (
+                event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+            ):
+                self._send_chat()
+                return True
+        return super().eventFilter(obj, event)
+
+    def _append_chat_text(self, text: str) -> None:
+        cur = self.chat_view.textCursor()
+        cur.movePosition(QTextCursor.MoveOperation.End)
+        cur.insertText(text)
+        self.chat_view.setTextCursor(cur)
+        self.chat_view.ensureCursorVisible()
+
+    def _send_chat(self) -> None:
+        if self.chat_running:
+            return
+        prompt_text = self.chat_input.toPlainText().strip()
+        if not prompt_text:
+            return
+        model_id = str(self.chat_model_combo.currentData() or self.chat_model_combo.currentText()).strip()
+        if not model_id:
+            self.chat_status.setText("モデルを選択または指定してください")
+            return
+
+        self.chat_input.clear()
+        if self.chat_history:
+            self._append_chat_text("\n\n")
+        self._append_chat_text(f"あなた:\n{prompt_text}\n\nアシスタント:\n")
+
+        self.chat_history.append({"role": "user", "content": prompt_text})
+        msgs: list[dict[str, str]] = []
+        sys_text = self.chat_system_edit.text().strip()
+        if sys_text:
+            msgs.append({"role": "system", "content": sys_text})
+        msgs.extend(self.chat_history)
+
+        backend = self._chat_backend()
+        temp = float(self.chat_temp_spin.value())
+        max_tok = int(self.chat_max_tok_spin.value())
+        cancel_ev = threading.Event()
+        self.chat_cancel = cancel_ev
+        self.chat_running = True
+        self._chat_reply_buf = []
+
+        self.chat_send_btn.setEnabled(False)
+        self.chat_stop_btn.setEnabled(True)
+        self.chat_clear_btn.setEnabled(False)
+        self.chat_mlx_radio.setEnabled(False)
+        self.chat_ollama_radio.setEnabled(False)
+
+        def work() -> None:
+            try:
+                if backend == "mlx":
+                    metrics = self.chat_session.stream_chat(
+                        Path(model_id),
+                        msgs,
+                        temperature=temp,
+                        max_tokens=max_tok,
+                        cancel_event=cancel_ev,
+                        on_chunk=self.chat_sig.chunk.emit,
+                        on_status=self.chat_sig.status.emit,
+                    )
+                else:
+                    metrics = ce.stream_ollama_chat(
+                        model_id,
+                        msgs,
+                        temperature=temp,
+                        max_tokens=max_tok,
+                        cancel_event=cancel_ev,
+                        on_chunk=self.chat_sig.chunk.emit,
+                        on_status=self.chat_sig.status.emit,
+                    )
+                self.chat_sig.finished.emit(metrics, None)
+            except BaseException as e:
+                self.chat_sig.finished.emit(None, e)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _stop_chat(self) -> None:
+        if self.chat_cancel is not None:
+            self.chat_cancel.set()
+            self.chat_status.setText("生成を停止中...")
+
+    def _clear_chat(self) -> None:
+        if self.chat_running:
+            return
+        self.chat_history.clear()
+        self.chat_view.clear()
+        self.chat_status.setText("会話履歴をクリアしました")
+
+    def _on_chat_chunk(self, chunk: str) -> None:
+        self._chat_reply_buf.append(chunk)
+        self._append_chat_text(chunk)
+
+    def _on_chat_status(self, msg: str) -> None:
+        self.chat_status.setText(msg)
+
+    def _on_chat_finished(self, metrics: object, err: object) -> None:
+        was_canceled = bool(self.chat_cancel and self.chat_cancel.is_set())
+        self.chat_running = False
+        self.chat_cancel = None
+        self.chat_send_btn.setEnabled(True)
+        self.chat_stop_btn.setEnabled(False)
+        self.chat_clear_btn.setEnabled(True)
+        self.chat_mlx_radio.setEnabled(tools.is_apple_silicon() and tools.mlx_lm_available())
+        self.chat_ollama_radio.setEnabled(True)
+
+        reply = "".join(self._chat_reply_buf)
+        if reply:
+            self.chat_history.append({"role": "assistant", "content": reply})
+        elif err is not None:
+            # Remove unpaired user message if nothing was generated on error
+            if self.chat_history and self.chat_history[-1]["role"] == "user":
+                self.chat_history.pop()
+
+        if err is not None:
+            self._append_chat_text(f"\n[エラー] {err}")
+            self.chat_status.setText(f"エラー: {err}")
+        elif was_canceled:
+            self._append_chat_text("\n[停止]")
+            self.chat_status.setText("生成を停止しました")
+        elif isinstance(metrics, ce.ChatMetrics):
+            tps_str = f" ({metrics.tps:.1f} tok/s)" if metrics.tps else ""
+            self.chat_status.setText(f"生成完了: {metrics.tokens} tokens{tps_str} / {metrics.elapsed:.1f}s")
+        else:
+            self.chat_status.setText("完了")
 
 
 def _esc(s: str) -> str:
