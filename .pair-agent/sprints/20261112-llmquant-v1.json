@@ -9,6 +9,11 @@
       "at": "2026-11-12T03:13:45+09:00",
       "status": "deliberating -> executing",
       "note": "スライスサイズ: おまかせ。初版の構築（Python + PySide6 GUI、llama.cpp v0.9.0 = b12110 = cd959bae を vendor/llama.cpp に固定、Ollama へ登録）"
+    },
+    {
+      "at": "2026-11-12",
+      "status": "executing",
+      "note": "マイルストーン: v0.1 を構築（コミット f7539fc, bdefaa5, 6972ebf）。テスト 43 件合格。GUI は 1600/1280/960 の 3 幅の撮影と run.bat の起動で確認済み。残り: 本物の変換・量子化・Ollama 登録の E2E（scripts/acceptance_e2e.py）は、自動モードが llama.cpp の実行を拒むため未実行。師匠が実行を許したら流す。スプリントは閉じない。振り返り（スキル確認）で Skill を新規 4 件・既存 6 件更新"
     }
   ]
 }
