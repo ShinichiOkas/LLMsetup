@@ -97,9 +97,10 @@ def test_gui_ollama_tab(app, monkeypatch):
     monkeypatch.setattr("llmquant.tools.ollama_show_modelfile", lambda name: f'FROM blob123\nSYSTEM You are an assistant.\nPARAMETER temperature 0.8\n')
 
     w = MainWindow()
-    assert w.tabs.count() == 2
+    assert w.tabs.count() == 3
     assert w.tabs.tabText(0) == "GGUF 量子化"
     assert w.tabs.tabText(1) == "Ollama モデル作成"
+    assert w.tabs.tabText(2) == "HF ダウンロード"
 
     # Switch to Ollama tab
     w.tabs.setCurrentIndex(1)
@@ -143,5 +144,50 @@ def test_gui_ollama_tab(app, monkeypatch):
     w._start_om_create()
     assert "使えない文字" in w.om_status.text()
     assert w.om_run_btn.isEnabled()
+
+    w.close()
+
+
+def test_gui_hf_tab(app, monkeypatch, tmp_path):
+    from llmquant import hf_downloader as hfd
+
+    mock_info = hfd.HfRepoInfo(
+        repo_id="mock-org/mock-model",
+        is_valid=True,
+        has_hf_weights=True,
+        total_files=5,
+        gguf_files=["model-Q4_K_M.gguf", "model-Q8_0.gguf"],
+        file_sizes={"model-Q4_K_M.gguf": 4000000},
+    )
+    monkeypatch.setattr("llmquant.hf_downloader.inspect_hf_repo", lambda repo, token=None: mock_info)
+
+    w = MainWindow()
+    w.tabs.setCurrentIndex(2)
+
+    # Inspect repo
+    w.hf_repo_edit.setText("mock-org/mock-model")
+    w._inspect_hf_repo()
+
+    assert "総ファイル数: 5" in w.hf_info_label.text()
+    assert "GGUFファイル: 2 個" in w.hf_info_label.text()
+    assert w.hf_file_combo.count() == 2
+
+    # Toggle radio mode
+    w.hf_mode_file_radio.setChecked(True)
+    assert w.hf_file_combo.isEnabled()
+    w.hf_mode_repo_radio.setChecked(True)
+    assert not w.hf_file_combo.isEnabled()
+
+    # Simulate download finished and set as base
+    target_file = tmp_path / "mock.gguf"
+    target_file.write_bytes(b"GGUF")
+    w._on_hf_finished(target_file, None)
+    assert w.hf_set_base_btn.isEnabled()
+    assert "完了" in w.hf_status.text()
+
+    # Click set base
+    w._set_downloaded_as_base()
+    assert w.tabs.currentIndex() == 0
+    assert w.path_edit.text() == str(target_file)
 
     w.close()

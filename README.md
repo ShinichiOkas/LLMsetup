@@ -1,14 +1,15 @@
 # LLMQuant
 
 LLM を llama.cpp で GGUF に量子化し、そのまま Ollama に登録する GUI ツール。
-ダウンロード済みの Ollama モデルから Modelfile を作成・カスタマイズして新しいモデルを作成（`ollama create`）する機能も備えています。
+Hugging Face からのモデルダウンロード、およびダウンロード済みの Ollama モデルから Modelfile を作成・カスタマイズして新しいモデルを作成（`ollama create`）する機能も備えています。
 
 ベース（HF 形式のモデルフォルダ、または `.gguf`）を指定すると、作れる量子化の種類が
 サイズの目安・GPU に載るか・品質・注意と一緒に一覧で出る。印を付けて「量子化を実行」すると
 GGUF ができ、望めば `ollama create` まで済む。
 
-また、「Ollama モデル作成」タブでは、ダウンロード済みモデルから Modelfile を自動取得・直接編集、
-システムプロンプトやパラメータ（temperature, num_ctx 等）を設定してワンクリックで新規モデルを作成できます。
+さらに、以下の機能も備えています:
+- **HF ダウンロード**: Hugging Face の Repo ID や URL からモデルリポジトリ全体（HF形式）や単体 `.gguf` ファイルを直接ダウンロードし、ワンクリックで量子化ベースに設定できます。
+- **Ollama モデル作成**: ダウンロード済みモデルから Modelfile を自動取得・直接編集、システムプロンプトやパラメータ（temperature, num_ctx 等。モデル情報の既定値・範囲付き）を設定して新規モデルを作成できます。
 
 ## 使い方
 
@@ -20,6 +21,8 @@ run.bat          :: GUI を開く（run.bat "D:\models\Qwen3-8B" でベースを
 CLI でも同じことができる（GUI と同じ芯を使う）:
 
 ```
+.venv\Scripts\python -m llmquant hf-inspect "Qwen/Qwen2.5-Coder-7B-Instruct"
+.venv\Scripts\python -m llmquant hf-download "Qwen/Qwen2.5-Coder-7B-Instruct"
 .venv\Scripts\python -m llmquant inspect "D:\models\Qwen3-8B"
 .venv\Scripts\python -m llmquant run "D:\models\Qwen3-8B" -t Q4_K_M -t Q6_K --ollama
 .venv\Scripts\python -m llmquant ollama-list

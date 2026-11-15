@@ -179,6 +179,53 @@ def cmd_ollama_create(a: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def cmd_hf_inspect(a: argparse.Namespace) -> int:
+    from . import hf_downloader as hfd
+
+    repo, fn = hfd.parse_hf_input(a.repo)
+    if not repo:
+        print("エラー: リポジトリ名または URL を指定してください", file=sys.stderr)
+        return 1
+    info = hfd.inspect_hf_repo(repo, token=a.token)
+    if not info.is_valid:
+        print(f"エラー: {info.error_message}", file=sys.stderr)
+        return 1
+    print(f"リポジトリ   : {info.repo_id}")
+    print(f"総ファイル数 : {info.total_files}")
+    print(f"HF重み形式   : {'あり (config.json + safetensors/bin)' if info.has_hf_weights else 'なし'}")
+    print(f"GGUFファイル : {len(info.gguf_files)} 個")
+    for g in info.gguf_files:
+        sz = info.file_sizes.get(g)
+        sz_str = f" ({sz:,} bytes)" if sz else ""
+        print(f"  - {g}{sz_str}")
+    return 0
+
+
+def cmd_hf_download(a: argparse.Namespace) -> int:
+    from . import hf_downloader as hfd
+
+    repo, fn = hfd.parse_hf_input(a.repo)
+    if not repo:
+        print("エラー: リポジトリ名または URL を指定してください", file=sys.stderr)
+        return 1
+    filename = a.file or fn
+    out_dir = Path(a.out_dir) if a.out_dir else Path("models") / repo.replace("/", "_")
+    job = hfd.HfDownloadJob(
+        repo_id=repo,
+        local_dir=out_dir,
+        filename=filename,
+        token=a.token,
+        on_log=print,
+    )
+    try:
+        path = job.run()
+        print(f"ダウンロード完了: {path}")
+        return 0
+    except Exception as e:
+        print(f"ダウンロード失敗: {e}", file=sys.stderr)
+        return 1
+
+
 def cmd_gui(a: argparse.Namespace) -> int:
     from .gui import run_gui
 
@@ -235,8 +282,20 @@ def main(argv: list[str] | None = None) -> int:
     oc.add_argument("--overwrite", action="store_true", help="同名のモデルが存在する場合に上書きする")
     oc.set_defaults(func=cmd_ollama_create)
 
+    hi = sub.add_parser("hf-inspect", help="Hugging Face リポジトリの情報を確認")
+    hi.add_argument("repo", help="Hugging Face リポジトリ名または URL（例: Qwen/Qwen2.5-Coder-7B-Instruct）")
+    hi.add_argument("--token", help="Hugging Face Access Token（任意）")
+    hi.set_defaults(func=cmd_hf_inspect)
+
+    hd = sub.add_parser("hf-download", help="Hugging Face からモデルまたは GGUF をダウンロード")
+    hd.add_argument("repo", help="Hugging Face リポジトリ名または URL")
+    hd.add_argument("--file", "-f", help="単体ファイルを指定してダウンロードする場合（例: model-Q4_K_M.gguf）")
+    hd.add_argument("--out-dir", "-o", help="保存先ディレクトリ（既定: models/<repo_name>）")
+    hd.add_argument("--token", help="Hugging Face Access Token（任意）")
+    hd.set_defaults(func=cmd_hf_download)
+
     argv = sys.argv[1:] if argv is None else argv
-    known_commands = ("gui", "inspect", "run", "doctor", "ollama-list", "ollama-create", "-h", "--help")
+    known_commands = ("gui", "inspect", "run", "doctor", "ollama-list", "ollama-create", "hf-inspect", "hf-download", "-h", "--help")
     if not argv or (argv[0] not in known_commands):
         argv = ["gui", *argv]
     a = p.parse_args(argv)

@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QSizePolicy,
     QSplitter,
@@ -38,6 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__, tools
+from . import hf_downloader as hfd
 from . import ollama_modelfile as om
 from .basemodel import KIND_GGUF, KIND_HF, BaseInfo, human_bytes, human_params, inspect_base, ollama_name, output_filename
 from .options import STATUS_DISABLED, STATUS_WARN, Environment, Option, build_options, fits_vram
@@ -62,6 +64,12 @@ class _OllamaSignals(QObject):
     log = Signal(str)
     progress = Signal(float, str)
     finished = Signal(bool)
+
+
+class _HfSignals(QObject):
+    log = Signal(str)
+    progress = Signal(float, str)
+    finished = Signal(object, object)  # dest_path, error
 
 
 class MainWindow(QMainWindow):
@@ -92,6 +100,15 @@ class MainWindow(QMainWindow):
         self.om_sig.progress.connect(self._on_om_progress)
         self.om_sig.finished.connect(self._on_om_finished)
 
+        # Hugging Face downloader state
+        self.hf_job: hfd.HfDownloadJob | None = None
+        self.hf_downloaded_path: Path | None = None
+        self.hf_info: hfd.HfRepoInfo | None = None
+        self.hf_sig = _HfSignals()
+        self.hf_sig.log.connect(self._append_hf_log)
+        self.hf_sig.progress.connect(self._on_hf_progress)
+        self.hf_sig.finished.connect(self._on_hf_finished)
+
         self._build()
         self.setAcceptDrops(True)
         self._refresh_tools()
@@ -118,6 +135,9 @@ class MainWindow(QMainWindow):
         ollama_widget = self._build_ollama_tab()
         self.tabs.addTab(ollama_widget, "Ollama モデル作成")
 
+        hf_widget = self._build_hf_tab()
+        self.tabs.addTab(hf_widget, "HF ダウンロード")
+
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.setCentralWidget(central)
 
@@ -141,9 +161,12 @@ class MainWindow(QMainWindow):
         b_dir.clicked.connect(self._pick_dir)
         b_file = QPushButton("GGUF を選ぶ…")
         b_file.clicked.connect(self._pick_file)
+        b_hf = QPushButton("HF からダウンロード…")
+        b_hf.clicked.connect(lambda: self.tabs.setCurrentIndex(2))
         row.addWidget(self.path_edit, 1)
         row.addWidget(b_dir)
         row.addWidget(b_file)
+        row.addWidget(b_hf)
         l1.addLayout(row)
         self.info_grid = QGridLayout()
         self.info_grid.setHorizontalSpacing(18)
@@ -493,6 +516,123 @@ class MainWindow(QMainWindow):
         self.om_log.setPlaceholderText("実行ログ")
         self.om_log.setMaximumHeight(160)
         layout.addWidget(self.om_log)
+
+        return w
+
+    def _build_hf_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(8)
+
+        # 1. Repository input & inspection
+        g1 = QGroupBox("1. Hugging Face リポジトリ")
+        l1 = QVBoxLayout(g1)
+
+        r1 = QHBoxLayout()
+        self.hf_repo_edit = QLineEdit()
+        self.hf_repo_edit.setPlaceholderText("Repo ID または URL（例: Qwen/Qwen2.5-Coder-7B-Instruct または bartowski/Llama-3.2-1B-Instruct-GGUF）")
+        self.hf_repo_edit.returnPressed.connect(self._inspect_hf_repo)
+        self.hf_inspect_btn = QPushButton("情報を取得")
+        self.hf_inspect_btn.clicked.connect(self._inspect_hf_repo)
+        r1.addWidget(QLabel("リポジトリ:"), 0)
+        r1.addWidget(self.hf_repo_edit, 1)
+        r1.addWidget(self.hf_inspect_btn)
+        l1.addLayout(r1)
+
+        r2 = QHBoxLayout()
+        self.hf_token_edit = QLineEdit()
+        self.hf_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.hf_token_edit.setPlaceholderText("（任意）非公開モデル用の Hugging Face Access Token（環境変数 HF_TOKEN があれば自動使用）")
+        r2.addWidget(QLabel("Token:"), 0)
+        r2.addWidget(self.hf_token_edit, 1)
+        l1.addLayout(r2)
+
+        self.hf_info_label = QLabel("-")
+        self.hf_info_label.setStyleSheet("color: palette(placeholder-text);")
+        self.hf_info_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        l1.addWidget(self.hf_info_label)
+        layout.addWidget(g1)
+
+        # 2. Download target selection
+        g2 = QGroupBox("2. ダウンロード対象")
+        l2 = QVBoxLayout(g2)
+
+        self.hf_mode_repo_radio = QRadioButton("モデルリポジトリ全体（HF形式: config.json + safetensors + tokenizer）")
+        self.hf_mode_repo_radio.setChecked(True)
+        self.hf_mode_repo_radio.toggled.connect(self._on_hf_mode_changed)
+        l2.addWidget(self.hf_mode_repo_radio)
+
+        row_file = QHBoxLayout()
+        self.hf_mode_file_radio = QRadioButton("単体 GGUF ファイルを選択:")
+        self.hf_mode_file_radio.toggled.connect(self._on_hf_mode_changed)
+        self.hf_file_combo = QComboBox()
+        self.hf_file_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.hf_file_combo.setEnabled(False)
+        row_file.addWidget(self.hf_mode_file_radio, 0)
+        row_file.addWidget(self.hf_file_combo, 1)
+        l2.addLayout(row_file)
+
+        layout.addWidget(g2)
+
+        # 3. Output directory & Download Run
+        g3 = QGroupBox("3. 保存先 & ダウンロード実行")
+        l3 = QVBoxLayout(g3)
+
+        row_out = QHBoxLayout()
+        self.hf_out_edit = QLineEdit()
+        default_dir = str(Path("models").resolve())
+        self.hf_out_edit.setText(default_dir)
+        self.hf_pick_out_btn = QPushButton("選ぶ…")
+        self.hf_pick_out_btn.clicked.connect(self._pick_hf_out_dir)
+        row_out.addWidget(QLabel("保存先フォルダ:"), 0)
+        row_out.addWidget(self.hf_out_edit, 1)
+        row_out.addWidget(self.hf_pick_out_btn)
+        l3.addLayout(row_out)
+
+        row_run = QHBoxLayout()
+        self.hf_download_btn = QPushButton("ダウンロード開始")
+        self.hf_download_btn.setMinimumHeight(34)
+        f = self.hf_download_btn.font()
+        f.setBold(True)
+        self.hf_download_btn.setFont(f)
+        self.hf_download_btn.clicked.connect(self._start_hf_download)
+
+        self.hf_cancel_btn = QPushButton("取り消し")
+        self.hf_cancel_btn.setEnabled(False)
+        self.hf_cancel_btn.clicked.connect(self._cancel_hf_download)
+
+        self.hf_progress = QProgressBar()
+        self.hf_progress.setRange(0, 1000)
+        self.hf_progress.setTextVisible(False)
+
+        self.hf_set_base_btn = QPushButton("このモデルを量子化ベースに設定 →")
+        self.hf_set_base_btn.setEnabled(False)
+        self.hf_set_base_btn.clicked.connect(self._set_downloaded_as_base)
+
+        row_run.addWidget(self.hf_download_btn)
+        row_run.addWidget(self.hf_cancel_btn)
+        row_run.addWidget(self.hf_progress, 1)
+        row_run.addWidget(self.hf_set_base_btn)
+        l3.addLayout(row_run)
+
+        self.hf_status = QLabel("")
+        self.hf_status.setWordWrap(True)
+        self.hf_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        l3.addWidget(self.hf_status)
+
+        layout.addWidget(g3)
+
+        # 4. Logs
+        self.hf_log = QPlainTextEdit()
+        self.hf_log.setReadOnly(True)
+        self.hf_log.setMaximumBlockCount(3000)
+        mono = QFont("Consolas")
+        mono.setStyleHint(QFont.StyleHint.Monospace)
+        mono.setPointSize(9)
+        self.hf_log.setFont(mono)
+        self.hf_log.setPlaceholderText("ダウンロード実行ログ")
+        layout.addWidget(self.hf_log, 1)
 
         return w
 
@@ -1182,6 +1322,163 @@ class MainWindow(QMainWindow):
             html = f'<span style="color:{color.name()}">{html}</span>'
         self.om_status.setText(html)
 
+    # ------------------------------------------------------------ Hugging Face tab
+    def _inspect_hf_repo(self) -> None:
+        raw_input = self.hf_repo_edit.text().strip()
+        repo_id, target_file = hfd.parse_hf_input(raw_input)
+        if not repo_id:
+            self._set_hf_status("リポジトリ名または URL を入力してください", self.c_red)
+            return
+
+        token = self.hf_token_edit.text().strip() or None
+        self._set_hf_status(f"'{repo_id}' の情報を取得中...", None)
+        self.hf_inspect_btn.setEnabled(False)
+        QApplication.processEvents()
+
+        try:
+            info = hfd.inspect_hf_repo(repo_id, token=token)
+            self.hf_info = info
+            if not info.is_valid:
+                self._set_hf_status(_esc(info.error_message), self.c_red)
+                self.hf_info_label.setText("-")
+                return
+
+            parts = [f"リポジトリ: {info.repo_id}", f"総ファイル数: {info.total_files}"]
+            if info.has_hf_weights:
+                parts.append("HF形式の重み: あり (safetensors/bin)")
+            if info.gguf_files:
+                parts.append(f"GGUFファイル: {len(info.gguf_files)} 個")
+
+            self.hf_info_label.setText("  |  ".join(parts))
+
+            # Populate GGUF combo
+            self.hf_file_combo.clear()
+            for g in info.gguf_files:
+                sz = info.file_sizes.get(g)
+                sz_str = f" ({human_bytes(sz)})" if sz else ""
+                self.hf_file_combo.addItem(f"{g}{sz_str}", g)
+
+            # Auto-suggest mode and target
+            if target_file and target_file in info.gguf_files:
+                idx = self.hf_file_combo.findData(target_file)
+                if idx >= 0:
+                    self.hf_file_combo.setCurrentIndex(idx)
+                self.hf_mode_file_radio.setChecked(True)
+            elif not info.has_hf_weights and info.gguf_files:
+                self.hf_mode_file_radio.setChecked(True)
+            else:
+                self.hf_mode_repo_radio.setChecked(True)
+
+            # Suggest local output directory
+            clean_name = repo_id.replace("/", "_")
+            self.hf_out_edit.setText(str((Path("models") / clean_name).resolve()))
+
+            self._set_hf_status(f"'{repo_id}' の情報を取得しました", None)
+
+        finally:
+            self.hf_inspect_btn.setEnabled(True)
+
+    def _on_hf_mode_changed(self) -> None:
+        is_file = self.hf_mode_file_radio.isChecked()
+        self.hf_file_combo.setEnabled(is_file)
+
+    def _pick_hf_out_dir(self) -> None:
+        cur = self.hf_out_edit.text().strip() or str(Path("models").resolve())
+        d = QFileDialog.getExistingDirectory(self, "保存先フォルダを選択", cur)
+        if d:
+            self.hf_out_edit.setText(d)
+
+    def _start_hf_download(self) -> None:
+        raw_input = self.hf_repo_edit.text().strip()
+        repo_id, explicit_file = hfd.parse_hf_input(raw_input)
+        if not repo_id:
+            self._set_hf_status("リポジトリ名または URL を入力してください", self.c_red)
+            return
+
+        out_dir_str = self.hf_out_edit.text().strip()
+        if not out_dir_str:
+            self._set_hf_status("保存先フォルダを指定してください", self.c_red)
+            return
+
+        target_file = None
+        if self.hf_mode_file_radio.isChecked():
+            target_file = self.hf_file_combo.currentData() or explicit_file
+            if not target_file:
+                self._set_hf_status("ダウンロードする GGUF ファイルを選択してください", self.c_red)
+                return
+
+        token = self.hf_token_edit.text().strip() or None
+        out_dir = Path(out_dir_str)
+
+        self.hf_download_btn.setEnabled(False)
+        self.hf_cancel_btn.setEnabled(True)
+        self.hf_set_base_btn.setEnabled(False)
+        self.hf_progress.setValue(0)
+        self._set_hf_status("ダウンロードを開始します...", None)
+        self.hf_log.clear()
+
+        job = hfd.HfDownloadJob(
+            repo_id=repo_id,
+            local_dir=out_dir,
+            filename=target_file,
+            token=token,
+            on_log=self.hf_sig.log.emit,
+            on_progress=self.hf_sig.progress.emit,
+        )
+        self.hf_job = job
+
+        def work() -> None:
+            try:
+                dest = job.run()
+                self.hf_sig.finished.emit(dest, None)
+            except BaseException as e:
+                self.hf_sig.finished.emit(None, e)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _cancel_hf_download(self) -> None:
+        if self.hf_job:
+            self.hf_job.cancel()
+            self._set_hf_status("取り消し中...", self.c_amber)
+
+    def _append_hf_log(self, text: str) -> None:
+        self.hf_log.appendPlainText(text)
+
+    def _on_hf_progress(self, frac: float, text: str) -> None:
+        self.hf_progress.setValue(int(frac * 1000))
+        self._set_hf_status(f"ダウンロード中 {frac:.0%}: {_esc(text)}", None)
+
+    def _on_hf_finished(self, dest_path: object, err: object) -> None:
+        self.hf_job = None
+        self.hf_download_btn.setEnabled(True)
+        self.hf_cancel_btn.setEnabled(False)
+
+        if err is None and dest_path:
+            self.hf_progress.setValue(1000)
+            p = Path(str(dest_path))
+            self.hf_downloaded_path = p
+            self.hf_set_base_btn.setEnabled(True)
+            self._set_hf_status(f"ダウンロード完了: {p.name} （「このモデルを量子化ベースに設定」で直接量子化へ進めます）", None)
+            self._append_hf_log(f"\n[完了] 保存先: {p}")
+        else:
+            self.hf_progress.setValue(0)
+            msg = str(err) if err else "不明なエラー"
+            self._set_hf_status(f"ダウンロード失敗: {_esc(msg)}", self.c_red)
+            self._append_hf_log(f"\n[エラー] {msg}")
+
+    def _set_downloaded_as_base(self) -> None:
+        if not self.hf_downloaded_path or not self.hf_downloaded_path.exists():
+            return
+        p_str = str(self.hf_downloaded_path)
+        self.path_edit.setText(p_str)
+        self.tabs.setCurrentIndex(0)
+        self.load_base(p_str)
+
+    def _set_hf_status(self, html: str, color: QColor | None) -> None:
+        if color is not None:
+            html = f'<span style="color:{color.name()}">{html}</span>'
+        self.hf_status.setText(html)
+
     def closeEvent(self, e) -> None:  # noqa: N802
         if self.runner is not None:
             ans = QMessageBox.question(self, "実行中", "量子化を実行中です。取り消して閉じますか？")
@@ -1195,6 +1492,12 @@ class MainWindow(QMainWindow):
                 e.ignore()
                 return
             self.om_job.cancel()
+        if self.hf_job is not None:
+            ans = QMessageBox.question(self, "実行中", "Hugging Face からのダウンロードを実行中です。取り消して閉じますか？")
+            if ans != QMessageBox.StandardButton.Yes:
+                e.ignore()
+                return
+            self.hf_job.cancel()
         e.accept()
 
 
