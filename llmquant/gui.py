@@ -38,10 +38,20 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import __version__, tools
+from . import __version__, catalog, tools
 from . import hf_downloader as hfd
 from . import ollama_modelfile as om
-from .basemodel import KIND_GGUF, KIND_HF, BaseInfo, human_bytes, human_params, inspect_base, ollama_name, output_filename
+from .basemodel import (
+    KIND_GGUF,
+    KIND_HF,
+    KIND_MLX,
+    BaseInfo,
+    human_bytes,
+    human_params,
+    inspect_base,
+    ollama_name,
+    output_filename,
+)
 from .options import STATUS_DISABLED, STATUS_WARN, Environment, Option, build_options, fits_vram
 from .pipeline import Cancelled, JobError, JobSpec, Runner, check_outputs, dry_run_size, plan
 
@@ -75,7 +85,7 @@ class _HfSignals(QObject):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle(f"LLMQuant {__version__} - LLM を GGUF に量子化して Ollama へ")
+        self.setWindowTitle(f"LLMQuant {__version__} - LLM 量子化 (GGUF / MLX)")
         self.base: BaseInfo | None = None
         self.options: list[Option] = []
         self.runner: Runner | None = None
@@ -130,7 +140,7 @@ class MainWindow(QMainWindow):
         root.addWidget(self.tabs, 1)
 
         quant_widget = self._build_quant_tab()
-        self.tabs.addTab(quant_widget, "GGUF 量子化")
+        self.tabs.addTab(quant_widget, "モデル量子化 (GGUF / MLX)")
 
         ollama_widget = self._build_ollama_tab()
         self.tabs.addTab(ollama_widget, "Ollama モデル作成")
@@ -142,13 +152,31 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
         vram = tools.gpu_vram_bytes()
-        self.info_labels["GPU"].setText(f"VRAM {human_bytes(vram)}" if vram else "（検出なし）")
+        if tools.is_apple_silicon() and vram:
+            self.info_labels["GPU"].setText(f"Unified {human_bytes(vram)}")
+        else:
+            self.info_labels["GPU"].setText(f"VRAM {human_bytes(vram)}" if vram else "（検出なし）")
 
     def _build_quant_tab(self) -> QWidget:
         w = QWidget()
         layout = QVBoxLayout(w)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(8)
+
+        # 0. target format
+        fmt_row = QHBoxLayout()
+        fmt_row.addWidget(QLabel("出力形式:"))
+        self.fmt_gguf_radio = QRadioButton("GGUF (llama.cpp / Ollama)")
+        self.fmt_mlx_radio = QRadioButton("MLX (Apple Silicon)")
+        self.fmt_gguf_radio.setChecked(True)
+        if not tools.is_apple_silicon():
+            self.fmt_mlx_radio.setEnabled(False)
+            self.fmt_mlx_radio.setToolTip("MLX は Apple Silicon Mac (arm64) 専用です")
+        self.fmt_gguf_radio.toggled.connect(self._on_format_changed)
+        fmt_row.addWidget(self.fmt_gguf_radio)
+        fmt_row.addWidget(self.fmt_mlx_radio)
+        fmt_row.addStretch(1)
+        layout.addLayout(fmt_row)
 
         # 1. base
         g1 = QGroupBox("1. ベースモデル（HF 形式のフォルダ、または .gguf）")
@@ -220,14 +248,15 @@ class MainWindow(QMainWindow):
         self.show_disabled.toggled.connect(self._apply_filter)
         opt_row.addWidget(self.show_disabled)
         opt_row.addSpacing(16)
-        opt_row.addWidget(QLabel("imatrix:"))
+        self.imatrix_label = QLabel("imatrix:")
+        opt_row.addWidget(self.imatrix_label)
         self.imatrix_edit = QLineEdit()
         self.imatrix_edit.setPlaceholderText("（任意）IQ1/IQ2/IQ3_XS 等に必要な重要度行列 .gguf / .dat")
         self.imatrix_edit.editingFinished.connect(self._rebuild_options)
-        b_im = QPushButton("選ぶ…")
-        b_im.clicked.connect(self._pick_imatrix)
+        self.imatrix_btn = QPushButton("選ぶ…")
+        self.imatrix_btn.clicked.connect(self._pick_imatrix)
         opt_row.addWidget(self.imatrix_edit, 1)
-        opt_row.addWidget(b_im)
+        opt_row.addWidget(self.imatrix_btn)
         l2.addLayout(opt_row)
 
         # 3. output + 4. ollama
@@ -255,7 +284,8 @@ class MainWindow(QMainWindow):
         chk_row.addStretch(1)
         f3.addRow("", chk_row)
 
-        g4 = QGroupBox("4. Ollama")
+        self.ollama_group = QGroupBox("4. Ollama")
+        g4 = self.ollama_group
         f4 = QFormLayout(g4)
         self.ollama_chk = QCheckBox("できた GGUF を Ollama に登録する（ollama create）")
         self.ollama_chk.setChecked(tools.ollama_exe() is not None)
@@ -645,10 +675,27 @@ class MainWindow(QMainWindow):
         self.info_labels["GPU"].setText(f"VRAM {human_bytes(vram)}" if vram else "（検出なし）")
 
     # ------------------------------------------------------------ tools
+    def target_format(self) -> str:
+        return catalog.FMT_MLX if self.fmt_mlx_radio.isChecked() else catalog.FMT_GGUF
+
+    def _on_format_changed(self) -> None:
+        is_mlx = self.target_format() == catalog.FMT_MLX
+        for w in (self.imatrix_label, self.imatrix_edit, self.imatrix_btn, self.keep_inter_chk, self.ollama_group):
+            w.setVisible(not is_mlx)
+        self.table.setHorizontalHeaderLabels(["", "種類", "サイズ", "メモリ" if is_mlx else "GPU", "品質", "説明・注意"])
+        self._refresh_tools()
+        if self.base is not None:
+            self.table.setRowCount(0)
+            self._render_base_info()
+            self._rebuild_options()
+
     def _refresh_tools(self) -> None:
         st = tools.tool_status()
-        if st.missing:
-            self._set_status("<br>".join(st.missing), self.c_red)
+        probs = st.mlx_missing if self.target_format() == catalog.FMT_MLX else st.missing
+        if probs:
+            self._set_status("<br>".join(probs), self.c_red)
+        elif self.base is None:
+            self._set_status("", None)
 
     # ------------------------------------------------------------ pickers / dnd
     def _start_dir(self) -> str:
@@ -699,34 +746,7 @@ class MainWindow(QMainWindow):
         self.path_edit.setText(path)
         base = inspect_base(path)
         self.base = base
-        L = self.info_labels
-        kind = {KIND_HF: "HF 形式（変換 → 量子化）", KIND_GGUF: "GGUF（量子化のみ）"}.get(base.kind, "対象外")
-        L["形式"].setText(kind)
-        L["名前"].setText(base.name or "-")
-        arch = base.architecture or "-"
-        if base.kind == KIND_HF and base.arch_supported:
-            arch += "（変換可）"
-        if base.is_moe:
-            arch += " / MoE"
-        L["構造"].setText(arch)
-        src = base.source_type or "-"
-        if base.is_quantized:
-            src += "（量子化済み）"
-        L["元の形式"].setText(src)
-        L["パラメータ"].setText(human_params(base.n_params) if base.n_params else "-")
-        L["重み"].setText(human_bytes(base.weight_bytes) if base.weight_bytes else "-")
-        L["チャットテンプレート"].setText({True: "あり", False: "なし", None: "-"}[base.has_chat_template])
-        for k in ("名前", "構造"):
-            L[k].setToolTip(L[k].text())
-
-        msgs = []
-        red, amber = self.c_red.name(), self.c_amber.name()
-        for p in base.problems:
-            msgs.append(f'<span style="color:{red}">作れません: {_esc(p)}</span>')
-        for w in base.warnings:
-            msgs.append(f'<span style="color:{amber}">注意: {_esc(w)}</span>')
-        self.msg_label.setText("<br>".join(msgs))
-        self.msg_label.setVisible(bool(msgs))
+        self._render_base_info()
 
         if self._out_dir_auto or not self.out_edit.text().strip():
             p = Path(path)
@@ -737,6 +757,51 @@ class MainWindow(QMainWindow):
             self._ollama_stem_auto = True
         self._rebuild_options()
 
+    def _render_base_info(self) -> None:
+        base = self.base
+        if base is None:
+            return
+        fmt = self.target_format()
+        L = self.info_labels
+        kind = {
+            KIND_HF: "HF 形式（変換 → 量子化）",
+            KIND_GGUF: "GGUF（量子化のみ）",
+            KIND_MLX: "MLX 量子化済み",
+        }.get(base.kind, "対象外")
+        L["形式"].setText(kind)
+        L["名前"].setText(base.name or "-")
+        if fmt == catalog.FMT_MLX and base.mlx_model_type:
+            arch = base.mlx_model_type
+            if base.mlx_supported is True:
+                arch += "（MLX 対応）"
+            elif base.mlx_supported is False:
+                arch += "（MLX 非対応）"
+        else:
+            arch = base.architecture or "-"
+            if base.kind == KIND_HF and base.arch_supported:
+                arch += "（変換可）"
+        if base.is_moe:
+            arch += " / MoE"
+        L["構造"].setText(arch)
+        src = base.source_type or "-"
+        if base.is_quantized and base.kind != KIND_MLX:
+            src += "（量子化済み）"
+        L["元の形式"].setText(src)
+        L["パラメータ"].setText(human_params(base.n_params) if base.n_params else "-")
+        L["重み"].setText(human_bytes(base.weight_bytes) if base.weight_bytes else "-")
+        L["チャットテンプレート"].setText({True: "あり", False: "なし", None: "-"}[base.has_chat_template])
+        for k in ("名前", "構造"):
+            L[k].setToolTip(L[k].text())
+
+        msgs = []
+        red, amber = self.c_red.name(), self.c_amber.name()
+        for p in base.problems_for(fmt):
+            msgs.append(f'<span style="color:{red}">作れません: {_esc(p)}</span>')
+        for w in base.warnings:
+            msgs.append(f'<span style="color:{amber}">注意: {_esc(w)}</span>')
+        self.msg_label.setText("<br>".join(msgs))
+        self.msg_label.setVisible(bool(msgs))
+
     def _imatrix(self) -> Path | None:
         t = self.imatrix_edit.text().strip().strip('"')
         return Path(t) if t else None
@@ -744,11 +809,13 @@ class MainWindow(QMainWindow):
     def _rebuild_options(self) -> None:
         if self.base is None:
             return
+        fmt = self.target_format()
         checked = set(self.selected_types())
         env = Environment.detect(Path(self.out_edit.text().strip() or "."))
-        self.options = build_options(self.base, env, self._imatrix())
+        self.options = build_options(self.base, env, self._imatrix() if fmt == catalog.FMT_GGUF else None, target_format=fmt)
         self._fill_table(checked)
-        self._start_exact_sizes()
+        if fmt == catalog.FMT_GGUF:
+            self._start_exact_sizes()
 
     def _fill_table(self, previously_checked: set[str]) -> None:
         t = self.table
@@ -894,13 +961,18 @@ class MainWindow(QMainWindow):
     def _spec(self) -> JobSpec | None:
         if self.base is None:
             return None
+        fmt = self.target_format()
         sel = self.selected_types()
         stem = self.ollama_edit.text().strip().lower() or ollama_name(self.base.stem, "x").split(":")[0]
+        is_gguf = fmt == catalog.FMT_GGUF
         return JobSpec(
             base=self.base, targets=sel, out_dir=Path(self.out_edit.text().strip() or "."),
-            imatrix=self._imatrix(), keep_intermediate=self.keep_inter_chk.isChecked(),
-            overwrite=self.overwrite_chk.isChecked(), register_ollama=self.ollama_chk.isChecked(),
-            ollama_names={t: f"{stem}:{t.lower()}" for t in sel},
+            imatrix=self._imatrix() if is_gguf else None,
+            keep_intermediate=self.keep_inter_chk.isChecked() if is_gguf else False,
+            overwrite=self.overwrite_chk.isChecked(),
+            register_ollama=self.ollama_chk.isChecked() if is_gguf else False,
+            ollama_names={t: f"{stem}:{t.lower()}" for t in sel} if is_gguf else {},
+            target_format=fmt,
         )
 
     def _update_plan(self) -> None:
@@ -910,7 +982,7 @@ class MainWindow(QMainWindow):
             self.run_btn.setEnabled(False)
             return
         sel = spec.targets
-        self.files_label.setText("\n".join(output_filename(spec.base.stem, t) for t in sel) or "-")
+        self.files_label.setText("\n".join(spec.output_path(t).name for t in sel) or "-")
         self.ollama_edit.setEnabled(spec.register_ollama)
         self.ollama_preview.setText(
             ("\n".join(spec.ollama_name_for(t) for t in sel) or "-") if spec.register_ollama else "（登録しない）")
@@ -919,11 +991,13 @@ class MainWindow(QMainWindow):
         if running:
             return
         if errs:
-            self._set_status("<br>".join(_esc(e) for e in errs), self.c_red if spec.base.ok and sel else self.c_grey)
+            self._set_status("<br>".join(_esc(e) for e in errs),
+                             self.c_red if spec.base.ok_for(spec.target_format) and sel else self.c_grey)
         else:
             total = sum(o.size_bytes for o in self.options if o.name in sel)
             steps = plan(spec)
-            self._set_status(f"準備よし: {len(sel)} 個の GGUF（合計 約 {human_bytes(total)}）を {len(steps)} 手順で作ります",
+            label = "MLX モデル" if spec.target_format == catalog.FMT_MLX else "GGUF"
+            self._set_status(f"準備よし: {len(sel)} 個の {label}（合計 約 {human_bytes(total)}）を {len(steps)} 手順で作ります",
                              None)
 
     def _set_status(self, html: str, color: QColor | None) -> None:
@@ -1346,6 +1420,8 @@ class MainWindow(QMainWindow):
             parts = [f"リポジトリ: {info.repo_id}", f"総ファイル数: {info.total_files}"]
             if info.has_hf_weights:
                 parts.append("HF形式の重み: あり (safetensors/bin)")
+            if info.is_mlx:
+                parts.append("MLXモデル: はい")
             if info.gguf_files:
                 parts.append(f"GGUFファイル: {len(info.gguf_files)} 個")
 
@@ -1474,6 +1550,8 @@ class MainWindow(QMainWindow):
         self.path_edit.setText(p_str)
         self.tabs.setCurrentIndex(0)
         self.load_base(p_str)
+        if self.base and self.base.kind == KIND_MLX and self.fmt_mlx_radio.isEnabled():
+            self.fmt_mlx_radio.setChecked(True)
 
     def _set_hf_status(self, html: str, color: QColor | None) -> None:
         if color is not None:

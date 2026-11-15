@@ -33,6 +33,7 @@ def fits_vram(size: int, vram: int | None) -> bool | None:
 # Q4_K_M is the floor: below it quality drops sharply, and Ollama can offload
 # part of a Q4_K_M model to the CPU instead.
 RECOMMEND_ORDER = ["Q8_0", "Q6_K", "Q5_K_M", "Q4_K_M"]
+MLX_RECOMMEND_ORDER = ["MLX-8bit", "MLX-6bit", "MLX-4bit"]
 
 _FLOAT_BITS = {"F32": 32, "F16": 16, "BF16": 16}
 
@@ -90,8 +91,15 @@ def intermediate_type(base: BaseInfo) -> str:
     return "BF16" if base.source_type == "BF16" else "F16"
 
 
-def build_options(base: BaseInfo, env: Environment | None = None, imatrix: Path | None = None) -> list[Option]:
-    if not base.ok:
+def build_options(
+    base: BaseInfo,
+    env: Environment | None = None,
+    imatrix: Path | None = None,
+    target_format: str = catalog.FMT_GGUF,
+) -> list[Option]:
+    if target_format == catalog.FMT_MLX:
+        return _build_mlx_options(base, env)
+    if not base.ok_for(catalog.FMT_GGUF):
         return []
     env = env or Environment()
     have_imatrix = bool(imatrix and Path(imatrix).is_file())
@@ -174,6 +182,46 @@ def build_options(base: BaseInfo, env: Environment | None = None, imatrix: Path 
             break
     if rec is None:
         o = by.get(catalog.DEFAULT_RECOMMENDED)
+        if o and o.enabled:
+            rec = o
+    if rec is None:
+        rec = next((o for o in opts if o.status == STATUS_OK and o.qtype.group != "float"), None)
+    if rec:
+        rec.recommended = True
+    return opts
+
+
+def _build_mlx_options(base: BaseInfo, env: Environment | None = None) -> list[Option]:
+    if not base.ok_for(catalog.FMT_MLX):
+        return []
+    env = env or Environment()
+    src = (base.source_type or "").upper()
+    opts: list[Option] = []
+    for q in catalog.MLX_CATALOG:
+        o = Option(q, estimate_bytes(base, q))
+        if q.mlx_dtype == "bfloat16" and src == "F16":
+            o.status = STATUS_WARN
+            o.notes.append("F16 → BF16 は仮数部が減るだけで利点がありません。MLX-FP16 を推奨")
+        elif q.mlx_dtype == "float16" and src == "BF16":
+            o.status = STATUS_WARN
+            o.notes.append("BF16 → F16 は値の範囲が狭まり、まれに溢れます。MLX-BF16 を推奨")
+        if env.out_free_bytes is not None and o.est_bytes > env.out_free_bytes:
+            o.status = STATUS_DISABLED
+            o.reasons.append(f"空き容量が足りません（必要 {human_bytes(o.est_bytes)} / 空き {human_bytes(env.out_free_bytes)}）")
+        o.fits_vram = fits_vram(o.est_bytes, env.vram_bytes)
+        opts.append(o)
+
+    by = {o.name: o for o in opts}
+    rec = None
+    for name in MLX_RECOMMEND_ORDER:
+        o = by.get(name)
+        if o and o.status == STATUS_OK and (o.fits_vram is None or o.fits_vram):
+            if o.fits_vram is None and name != catalog.DEFAULT_MLX_RECOMMENDED:
+                continue
+            rec = o
+            break
+    if rec is None:
+        o = by.get(catalog.DEFAULT_MLX_RECOMMENDED)
         if o and o.enabled:
             rec = o
     if rec is None:

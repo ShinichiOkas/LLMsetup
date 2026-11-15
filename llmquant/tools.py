@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import importlib.metadata
+import importlib.util
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -259,21 +262,98 @@ def supported_architectures() -> frozenset[str] | None:
     return _supported_architectures_cached(str(root), mtime)
 
 
+def is_apple_silicon() -> bool:
+    """True when running on an Apple Silicon Mac."""
+    return sys.platform == "darwin" and platform.machine() == "arm64"
+
+
+def mlx_lm_available() -> bool:
+    """True when both mlx and mlx_lm are importable in the current Python."""
+    return importlib.util.find_spec("mlx") is not None and importlib.util.find_spec("mlx_lm") is not None
+
+
+def mlx_lm_version() -> str | None:
+    if not mlx_lm_available():
+        return None
+    try:
+        return importlib.metadata.version("mlx-lm")
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+@lru_cache(maxsize=2)
+def _mlx_supported_model_types_cached(models_dir_str: str, utils_mtime: float) -> frozenset[str]:
+    import ast
+
+    models_dir = Path(models_dir_str)
+    types: set[str] = {
+        p.stem for p in models_dir.glob("*.py")
+        if not p.name.startswith("_")
+    }
+    utils_py = models_dir.parent / "utils.py"
+    if utils_py.is_file():
+        try:
+            tree = ast.parse(utils_py.read_text(encoding="utf-8", errors="replace"))
+            for node in tree.body:
+                if isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name) and target.id == "MODEL_REMAPPING":
+                            mapping = ast.literal_eval(node.value)
+                            if isinstance(mapping, dict):
+                                for k, v in mapping.items():
+                                    if v in types:
+                                        types.add(str(k))
+        except (OSError, SyntaxError, ValueError):
+            pass
+    return frozenset(types)
+
+
+def mlx_supported_model_types() -> frozenset[str] | None:
+    """HF ``model_type`` names supported by the installed ``mlx_lm`` package.
+
+    Inspected statically from ``mlx_lm/models/*.py`` and ``MODEL_REMAPPING``
+    in ``mlx_lm/utils.py`` so neither ``mlx`` nor ``transformers`` is imported.
+    Returns None when ``mlx_lm`` is not installed.
+    """
+    spec = importlib.util.find_spec("mlx_lm")
+    if spec is None or not spec.submodule_search_locations:
+        return None
+    pkg_dir = Path(next(iter(spec.submodule_search_locations)))
+    models_dir = pkg_dir / "models"
+    if not models_dir.is_dir():
+        return None
+    utils_py = pkg_dir / "utils.py"
+    mtime = utils_py.stat().st_mtime if utils_py.is_file() else 0.0
+    return _mlx_supported_model_types_cached(str(models_dir), mtime)
+
+
 @dataclass
 class ToolStatus:
     quantize: Path | None
     converter: Path | None
     ollama: Path | None
     llama_version: str | None
+    apple_silicon: bool = False
+    mlx_available: bool = False
+    mlx_version: str | None = None
 
     @property
     def missing(self) -> list[str]:
         out = []
+        setup_hint = "install.sh" if sys.platform == "darwin" else "install.bat"
         if self.quantize is None:
-            out.append(f"llama-quantize が見つかりません（{llama_bin_dir()}）。install.bat を実行してください")
+            out.append(f"llama-quantize が見つかりません（{llama_bin_dir()}）。{setup_hint} を実行してください")
         if self.converter is None:
-            out.append(f"convert_hf_to_gguf.py が見つかりません（{llama_cpp_dir()}）。install.bat を実行してください")
+            out.append(f"convert_hf_to_gguf.py が見つかりません（{llama_cpp_dir()}）。{setup_hint} を実行してください")
         return out
+
+    @property
+    def mlx_missing(self) -> list[str]:
+        if not self.apple_silicon:
+            return ["MLX は Apple Silicon Mac (arm64) 専用です"]
+        if not self.mlx_available:
+            return ["mlx-lm がインストールされていません。install.sh を実行してください"]
+        return []
 
 
 def llama_bin_version() -> str | None:
@@ -285,24 +365,43 @@ def llama_bin_version() -> str | None:
 
 
 def tool_status() -> ToolStatus:
-    return ToolStatus(quantize_exe(), converter_script(), ollama_exe(), llama_bin_version())
+    return ToolStatus(
+        quantize_exe(),
+        converter_script(),
+        ollama_exe(),
+        llama_bin_version(),
+        apple_silicon=is_apple_silicon(),
+        mlx_available=mlx_lm_available(),
+        mlx_version=mlx_lm_version(),
+    )
 
 
 @lru_cache(maxsize=1)
 def gpu_vram_bytes() -> int | None:
-    """Total VRAM of the largest NVIDIA GPU, or None."""
+    """Total VRAM of the largest NVIDIA GPU, or Unified Memory on Apple Silicon, or None."""
     smi = shutil.which("nvidia-smi")
-    if not smi:
-        return None
-    try:
-        out = subprocess.run(
-            [smi, "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5, creationflags=CREATE_NO_WINDOW,
-        ).stdout
-        vals = [int(x.strip()) for x in out.splitlines() if x.strip().isdigit()]
-        return max(vals) * 1024 * 1024 if vals else None
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return None
+    if smi:
+        try:
+            out = subprocess.run(
+                [smi, "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5, creationflags=CREATE_NO_WINDOW,
+            ).stdout
+            vals = [int(x.strip()) for x in out.splitlines() if x.strip().isdigit()]
+            if vals:
+                return max(vals) * 1024 * 1024
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+    if is_apple_silicon():
+        try:
+            out = subprocess.run(
+                ["sysctl", "-n", "hw.memsize"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+            if out.isdigit():
+                return int(out)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+    return None
 
 
 def free_bytes(path: Path) -> int | None:

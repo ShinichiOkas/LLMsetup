@@ -98,7 +98,7 @@ def test_gui_ollama_tab(app, monkeypatch):
 
     w = MainWindow()
     assert w.tabs.count() == 3
-    assert w.tabs.tabText(0) == "GGUF 量子化"
+    assert w.tabs.tabText(0) == "モデル量子化 (GGUF / MLX)"
     assert w.tabs.tabText(1) == "Ollama モデル作成"
     assert w.tabs.tabText(2) == "HF ダウンロード"
 

@@ -28,6 +28,8 @@ class HfRepoInfo:
     error_message: str = ""
     gguf_files: list[str] = field(default_factory=list)
     has_hf_weights: bool = False
+    is_mlx: bool = False
+    tags: list[str] = field(default_factory=list)
     pipeline_tag: str = ""
     total_files: int = 0
     file_sizes: dict[str, int] = field(default_factory=dict)
@@ -75,6 +77,7 @@ def inspect_hf_repo(repo_id: str, token: str | None = None) -> HfRepoInfo:
         m_info = api.model_info(repo_id, files_metadata=True)
         info.is_valid = True
         info.pipeline_tag = getattr(m_info, "pipeline_tag", "") or ""
+        info.tags = list(getattr(m_info, "tags", None) or [])
 
         files = []
         if getattr(m_info, "siblings", None):
@@ -93,6 +96,11 @@ def inspect_hf_repo(repo_id: str, token: str | None = None) -> HfRepoInfo:
         has_config = "config.json" in files
         has_weights = any(f.endswith(".safetensors") or f.endswith(".bin") for f in files)
         info.has_hf_weights = has_config and has_weights
+        info.is_mlx = info.has_hf_weights and (
+            "mlx" in [t.lower() for t in info.tags]
+            or repo_id.lower().startswith("mlx-community/")
+            or "mlx" in repo_id.lower().split("/")[-1].split("-")
+        )
 
     except RepositoryNotFoundError:
         info.is_valid = False

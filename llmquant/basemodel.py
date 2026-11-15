@@ -18,6 +18,7 @@ from .gguf_reader import GGUFError, is_gguf, read_all_parts
 
 KIND_HF = "hf"
 KIND_GGUF = "gguf"
+KIND_MLX = "mlx"
 KIND_UNSUPPORTED = "unsupported"
 
 _ST_DTYPES = {
@@ -43,9 +44,14 @@ class BaseInfo:
     is_ternary: bool = False
     has_chat_template: bool | None = None
     context_length: int | None = None
-    model_dir: Path | None = None  # HF folder
+    model_dir: Path | None = None  # HF / MLX folder
     gguf_parts: list[Path] = field(default_factory=list)
-    problems: list[str] = field(default_factory=list)  # fatal: no options possible
+    problems: list[str] = field(default_factory=list)  # fatal: no options possible (GGUF / common)
+    gguf_only_problems: list[str] = field(default_factory=list)  # subset of problems specific to GGUF conversion
+    mlx_problems: list[str] = field(default_factory=list)  # fatal for MLX conversion
+    mlx_model_type: str | None = None
+    mlx_supported: bool | None = None
+    mlx_quant: dict | None = None  # {"bits": 4, "group_size": 64, "mode": "affine"} for KIND_MLX
     warnings: list[str] = field(default_factory=list)
     details: dict[str, str] = field(default_factory=dict)
     file_stem: str = ""  # base for output file / Ollama names (file or folder name)
@@ -57,6 +63,21 @@ class BaseInfo:
     @property
     def ok(self) -> bool:
         return self.kind != KIND_UNSUPPORTED and not self.problems
+
+    def problems_for(self, fmt: str) -> list[str]:
+        if fmt == "mlx":
+            if self.kind == KIND_GGUF:
+                return ["GGUF ファイルから MLX 形式への変換は非対応です（HF 形式のフォルダを指定してください）"]
+            if self.kind == KIND_MLX:
+                return ["すでに MLX 形式で量子化済みのモデルです（そのまま MLX で利用できます）"]
+            common = [p for p in self.problems if p not in self.gguf_only_problems]
+            return common + list(self.mlx_problems)
+        if self.kind == KIND_MLX:
+            return ["MLX 量子化済みモデルから GGUF への変換は非対応です"]
+        return list(self.problems)
+
+    def ok_for(self, fmt: str) -> bool:
+        return self.kind != KIND_UNSUPPORTED and not self.problems_for(fmt)
 
     @property
     def n_params_2d(self) -> int:
@@ -164,6 +185,7 @@ def _inspect_hf(model_dir: Path, picked: Path) -> BaseInfo:
     archs = cfg.get("architectures") or []
     info.architecture = archs[0] if archs else None
     text = _sub(cfg)
+    info.mlx_model_type = cfg.get("model_type") or text.get("model_type")
     info.context_length = text.get("max_position_embeddings") or cfg.get("max_position_embeddings")
     for key in ("num_local_experts", "num_experts", "n_routed_experts", "moe_num_experts"):
         if (text.get(key) or cfg.get(key) or 0) > 1:
@@ -171,29 +193,59 @@ def _inspect_hf(model_dir: Path, picked: Path) -> BaseInfo:
     if info.architecture and "bitnet" in info.architecture.lower():
         info.is_ternary = True
 
+    # Detect pre-quantized MLX model folder
+    qcfg = cfg.get("quantization") or cfg.get("quantization_config")
+    if isinstance(qcfg, dict) and ("bits" in qcfg and "group_size" in qcfg):
+        info.kind = KIND_MLX
+        info.is_quantized = True
+        info.mlx_quant = dict(qcfg)
+        bits = qcfg.get("bits")
+        gs = qcfg.get("group_size")
+        mode = qcfg.get("mode", "affine")
+        info.source_type = f"MLX-{mode}" if mode != "affine" else f"MLX-{bits}bit"
+        info.details["MLX 量子化"] = f"{bits}bit (group_size={gs}, mode={mode})"
+
     supported = tools.supported_architectures()
     if not archs:
         info.arch_supported = False
-        info.problems.append("config.json に architectures がありません（LLM の HF 形式ではないようです）")
+        msg = "config.json に architectures がありません（LLM の HF 形式ではないようです）"
+        info.problems.append(msg)
+        info.gguf_only_problems.append(msg)
     elif supported is None:
         info.arch_supported = None
-        info.warnings.append("変換器（llama.cpp）が未取得のため、対応構造を確かめられません。install.bat を実行してください")
+        info.warnings.append("変換器（llama.cpp）が未取得のため、GGUF 対応構造を確かめられません")
     else:
         hit = [a for a in archs if a in supported]
         info.arch_supported = bool(hit)
         if hit:
             info.architecture = hit[0]
+        elif info.kind != KIND_MLX:
+            msg = f"構造 {', '.join(archs)} は llama.cpp {tools.LLAMA_RELEASE} の変換器が対応していません"
+            info.problems.append(msg)
+            info.gguf_only_problems.append(msg)
+
+    # Check MLX model_type support
+    mlx_types = tools.mlx_supported_model_types()
+    if not info.mlx_model_type:
+        info.mlx_supported = False
+        info.mlx_problems.append("config.json に model_type がありません（MLX 非対応）")
+    elif mlx_types is None:
+        info.mlx_supported = None
+        if not tools.is_apple_silicon():
+            info.mlx_problems.append("MLX は Apple Silicon Mac (arm64) 専用です")
         else:
-            info.problems.append(
-                f"構造 {', '.join(archs)} は llama.cpp {tools.LLAMA_RELEASE} の変換器が対応していません"
-            )
+            info.mlx_problems.append("mlx-lm が未導入のため、MLX 対応構造を確かめられません。install.sh を実行してください")
+    else:
+        info.mlx_supported = info.mlx_model_type in mlx_types
+        if not info.mlx_supported:
+            info.mlx_problems.append(f"model_type '{info.mlx_model_type}' は導入済み mlx-lm が対応していません")
 
     files = _weight_files(model_dir)
     if files:
         try:
             n, n1, nbytes, dtypes = _count_safetensors(files)
             info.n_params, info.n_params_1d, info.weight_bytes = n, n1, nbytes
-            if dtypes:
+            if dtypes and info.kind != KIND_MLX:
                 main = max(dtypes, key=lambda k: dtypes[k])
                 info.source_type = {"F16": "F16", "BF16": "BF16", "F32": "F32"}.get(main, main)
                 if main.startswith("F8") or main in ("I8", "U8", "I32", "F4"):
@@ -370,7 +422,12 @@ def output_filename(base_name: str, qtype: str) -> str:
     return f"{strip_type_suffix(stem)}-{qtype}.gguf"
 
 
+def output_mlx_dirname(base_name: str, qtype: str) -> str:
+    stem = re.sub(r'[\\/:*?"<>|]+', "-", base_name).strip() or "model"
+    return f"{strip_type_suffix(stem)}-{qtype}"
+
+
 __all__ = [
-    "BaseInfo", "inspect_base", "human_bytes", "human_params", "ollama_name", "output_filename",
-    "KIND_HF", "KIND_GGUF", "KIND_UNSUPPORTED", "LLAMA_FTYPES",
+    "BaseInfo", "inspect_base", "human_bytes", "human_params", "ollama_name", "output_filename", "output_mlx_dirname",
+    "KIND_HF", "KIND_GGUF", "KIND_MLX", "KIND_UNSUPPORTED", "LLAMA_FTYPES",
 ]

@@ -13,9 +13,16 @@ GGUF ができ、望めば `ollama create` まで済む。
 
 ## 使い方
 
+Windows:
 ```
 install.bat      :: 初回と git pull の後。venv・依存・llama.cpp（固定版）をそろえる
 run.bat          :: GUI を開く（run.bat "D:\models\Qwen3-8B" でベースを指定して開く）
+```
+
+macOS (Apple Silicon / MLX 対応):
+```
+./install.sh     :: 初回と git pull の後。venv・依存（mlx-lm 含む）をそろえる
+./run.sh         :: GUI を開く（./run.sh /path/to/model でベースを指定して開く）
 ```
 
 CLI でも同じことができる（GUI と同じ芯を使う）:
@@ -25,6 +32,8 @@ CLI でも同じことができる（GUI と同じ芯を使う）:
 .venv\Scripts\python -m llmquant hf-download "Qwen/Qwen2.5-Coder-7B-Instruct"
 .venv\Scripts\python -m llmquant inspect "D:\models\Qwen3-8B"
 .venv\Scripts\python -m llmquant run "D:\models\Qwen3-8B" -t Q4_K_M -t Q6_K --ollama
+.venv/bin/python -m llmquant inspect /path/to/model --format mlx
+.venv/bin/python -m llmquant run /path/to/model --format mlx -t MLX-4bit
 .venv\Scripts\python -m llmquant ollama-list
 .venv\Scripts\python -m llmquant ollama-create qwen2.5:7b my-qwen:latest --system "あなたはアシスタントです" --param temperature=0.7
 .venv\Scripts\python -m llmquant doctor

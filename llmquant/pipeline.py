@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -18,9 +19,8 @@ from pathlib import Path
 from typing import Callable
 
 from . import catalog, tools
-from .basemodel import KIND_GGUF, KIND_HF, BaseInfo, ollama_name, output_filename
+from .basemodel import KIND_GGUF, KIND_HF, BaseInfo, human_bytes, ollama_name, output_filename, output_mlx_dirname
 from .gguf_reader import read_header
-from .basemodel import human_bytes
 from .options import Environment, build_options, intermediate_type
 
 
@@ -44,8 +44,11 @@ class JobSpec:
     register_ollama: bool = False
     ollama_names: dict[str, str] = field(default_factory=dict)
     threads: int | None = None
+    target_format: str = catalog.FMT_GGUF
 
     def output_path(self, qtype: str) -> Path:
+        if self.target_format == catalog.FMT_MLX:
+            return Path(self.out_dir) / output_mlx_dirname(self.base.stem, qtype)
         return Path(self.out_dir) / output_filename(self.base.stem, qtype)
 
     def ollama_name_for(self, qtype: str) -> str:
@@ -78,6 +81,8 @@ def _part(p: Path) -> Path:
 
 def check_outputs(spec: JobSpec) -> list[str]:
     """Problems that must be resolved before running (empty = OK)."""
+    if spec.target_format == catalog.FMT_MLX:
+        return _check_mlx_outputs(spec)
     errs: list[str] = []
     if not spec.base.ok:
         errs.extend(spec.base.problems or ["このベースからは作れません"])
@@ -157,7 +162,35 @@ def template_is_bare(show_modelfile: str) -> bool:
     return body in ("", "{{ .Prompt }}")
 
 
+def _check_mlx_outputs(spec: JobSpec) -> list[str]:
+    errs: list[str] = []
+    if not spec.base.ok_for(catalog.FMT_MLX):
+        errs.extend(spec.base.problems_for(catalog.FMT_MLX) or ["このベースから MLX 形式は作れません"])
+    if not spec.targets:
+        errs.append("量子化の種類を 1 つ以上選んでください")
+    st = tools.tool_status()
+    if st.mlx_missing:
+        errs.extend(st.mlx_missing)
+    if not spec.overwrite:
+        for t in spec.targets:
+            p = spec.output_path(t)
+            if p.exists():
+                errs.append(f"出力先に同名のファイルまたはフォルダがあります: {p.name}（上書きするなら「上書き」に印）")
+    if spec.base.ok_for(catalog.FMT_MLX) and spec.targets:
+        env = Environment.detect(Path(spec.out_dir))
+        by = {o.name.upper(): o for o in build_options(spec.base, env, target_format=catalog.FMT_MLX)}
+        for t in spec.targets:
+            o = by.get(t.upper())
+            if o is None:
+                errs.append(f"{t} は MLX で扱えない種類です")
+            elif not o.enabled:
+                errs.append(f"{t} は作れません: {' / '.join(o.reasons)}")
+    return errs
+
+
 def plan(spec: JobSpec) -> list[Step]:
+    if spec.target_format == catalog.FMT_MLX:
+        return _plan_mlx_steps(spec)
     base = spec.base
     steps: list[Step] = []
     out_dir = Path(spec.out_dir)
@@ -238,6 +271,49 @@ def plan(spec: JobSpec) -> list[Step]:
             steps.append(Step(f"Ollama に登録: {name}", "ollama", action=_ollama_create(spec.output_path(t), name, t),
                               weight=0.3 * gb))
     return steps
+
+
+def _plan_mlx_steps(spec: JobSpec) -> list[Step]:
+    base = spec.base
+    if base.kind != KIND_HF or not base.model_dir:
+        raise JobError("MLX 変換には HF 形式のモデルフォルダが必要です")
+    steps: list[Step] = []
+    py = str(tools.python_exe())
+    model_dir = str(base.model_dir)
+    gb = max(base.n_params / 1e9, 0.1)
+    for t in spec.targets:
+        q = catalog.get(t, catalog.FMT_MLX)
+        final = spec.output_path(q.name)
+        part = _part(final)
+        cmd = [py, "-m", "mlx_lm", "convert", "--hf-path", model_dir, "--mlx-path", str(part)]
+        if q.mlx_dtype:
+            cmd += ["--dtype", q.mlx_dtype]
+        else:
+            cmd += ["-q", "--q-bits", str(q.mlx_bits), "--q-group-size", str(q.mlx_group_size), "--q-mode", q.mlx_mode]
+        steps.append(Step(
+            f"MLX 変換・量子化: {q.name}", "mlx_convert",
+            cmd=cmd, partial=part, final=final, weight=1.5 * gb,
+        ))
+        steps.append(Step(
+            f"確認: {q.name} の MLX 出力を確かめる", "verify",
+            action=_verify_mlx_output(final, q.name), weight=0.01,
+        ))
+    return steps
+
+
+def _verify_mlx_output(p: Path, t: str) -> Callable[["Runner"], None]:
+    def run(r: "Runner") -> None:
+        if not p.is_dir():
+            raise JobError(f"出力フォルダがありません: {p}")
+        if not (p / "config.json").is_file():
+            raise JobError(f"出力フォルダに config.json がありません: {p}")
+        st_files = list(p.glob("*.safetensors"))
+        if not st_files:
+            raise JobError(f"出力フォルダに safetensors ファイルがありません: {p}")
+        total = sum(f.stat().st_size for f in p.iterdir() if f.is_file())
+        r.log(f"MLX 出力確認: {p.name}  safetensors={len(st_files)} 個  total={total:,} bytes")
+        r.result.outputs[t] = p
+    return run
 
 
 # ---------------------------------------------------------------- actions
@@ -371,14 +447,22 @@ class Runner:
                 self.log(f"=== [{i + 1}/{len(self.steps)}] {step.title}")
                 self._report(0.0, step)
                 if step.partial and step.partial.exists():
-                    step.partial.unlink()
+                    if step.partial.is_dir():
+                        shutil.rmtree(step.partial)
+                    else:
+                        step.partial.unlink()
                 if step.cmd:
                     self.run_cmd(step.cmd, kind=step.kind, step=step)
                 if step.action:
                     step.action(self)
                 if step.partial and step.final:
-                    if not step.partial.is_file():
+                    if not step.partial.exists():
                         raise JobError(f"出力ができていません: {step.partial}")
+                    if step.partial.is_dir() and step.final.exists():
+                        if step.final.is_dir():
+                            shutil.rmtree(step.final)
+                        else:
+                            step.final.unlink()
                     os.replace(step.partial, step.final)
                     self.log(f"出力: {step.final}")
                 self._done += step.weight
@@ -404,7 +488,10 @@ class Runner:
             for f in doomed:
                 if f and f.exists():
                     try:
-                        f.unlink()
+                        if f.is_dir():
+                            shutil.rmtree(f)
+                        else:
+                            f.unlink()
                         self.log(f"途中のファイルを削除: {f}")
                     except OSError:
                         pass

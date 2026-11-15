@@ -12,6 +12,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# Output format constants
+FMT_GGUF = "gguf"
+FMT_MLX = "mlx"
+
 # Ollama compatibility levels
 OLLAMA_OK = "ok"  # long-established type, loads in Ollama
 OLLAMA_UNVERIFIED = "unverified"  # new in recent llama.cpp; may not load in Ollama
@@ -32,6 +36,11 @@ class QuantType:
     imatrix: str = IMATRIX_NONE
     ollama: str = OLLAMA_OK
     special: str = ""  # "ternary" / "moe" for arch-restricted types
+    fmt: str = FMT_GGUF
+    mlx_bits: int | None = None
+    mlx_group_size: int | None = None
+    mlx_mode: str = "affine"
+    mlx_dtype: str | None = None
 
 
 CATALOG: list[QuantType] = [
@@ -74,11 +83,35 @@ CATALOG: list[QuantType] = [
 
 BY_NAME: dict[str, QuantType] = {q.name: q for q in CATALOG}
 
+MLX_CATALOG: list[QuantType] = [
+    QuantType("MLX-BF16", 16.0, 6, "float", "無量子化 BF16（MLX 形式へ変換のみ）。元が BF16 ならこれ", fmt=FMT_MLX, mlx_dtype="bfloat16"),
+    QuantType("MLX-FP16", 16.0, 6, "float", "無量子化 FP16（MLX 形式へ変換のみ）。元が FP16 ならこれ", fmt=FMT_MLX, mlx_dtype="float16"),
+    QuantType("MLX-8bit", 8.5, 5, "affine", "ほぼ無劣化の 8bit（group_size=64）。メモリに余裕があれば", fmt=FMT_MLX, mlx_bits=8, mlx_group_size=64, mlx_mode="affine"),
+    QuantType("MLX-6bit", 6.5, 5, "affine", "高品質 6bit（group_size=64）", fmt=FMT_MLX, mlx_bits=6, mlx_group_size=64, mlx_mode="affine"),
+    QuantType("MLX-4bit-g32", 5.0, 4, "affine", "高精度 4bit（group_size=32）。少し大きいが高品質", fmt=FMT_MLX, mlx_bits=4, mlx_group_size=32, mlx_mode="affine"),
+    QuantType("MLX-4bit", 4.5, 4, "affine", "標準 4bit（group_size=64）。品質とメモリ効率の最良バランス・定番", fmt=FMT_MLX, mlx_bits=4, mlx_group_size=64, mlx_mode="affine"),
+    QuantType("MLX-4bit-g128", 4.25, 3, "affine", "軽量 4bit（group_size=128）。より省メモリ", fmt=FMT_MLX, mlx_bits=4, mlx_group_size=128, mlx_mode="affine"),
+    QuantType("MLX-mxfp4", 4.25, 4, "mxfp4", "MXFP4 形式（4bit 浮動小数・group_size=32）", fmt=FMT_MLX, mlx_bits=4, mlx_group_size=32, mlx_mode="mxfp4"),
+    QuantType("MLX-3bit", 3.5, 2, "affine", "3bit（group_size=64）。劣化あり・メモリが厳しいとき", fmt=FMT_MLX, mlx_bits=3, mlx_group_size=64, mlx_mode="affine"),
+    QuantType("MLX-2bit", 2.5, 1, "affine", "2bit（group_size=64）。大幅劣化・巨大モデル用", fmt=FMT_MLX, mlx_bits=2, mlx_group_size=64, mlx_mode="affine"),
+]
+
+MLX_BY_NAME: dict[str, QuantType] = {q.name.upper(): q for q in MLX_CATALOG}
+
 # Types the HF converter can write directly (skips llama-quantize)
 CONVERTER_OUTTYPES = {"F32": "f32", "F16": "f16", "BF16": "bf16", "Q8_0": "q8_0"}
 
 DEFAULT_RECOMMENDED = "Q4_K_M"
+DEFAULT_MLX_RECOMMENDED = "MLX-4bit"
 
 
-def get(name: str) -> QuantType:
-    return BY_NAME[name.upper()]
+def get(name: str, fmt: str = FMT_GGUF) -> QuantType:
+    key = name.upper()
+    if fmt == FMT_MLX or key in MLX_BY_NAME:
+        if key in MLX_BY_NAME:
+            return MLX_BY_NAME[key]
+    return BY_NAME[key]
+
+
+def catalog_for(fmt: str) -> list[QuantType]:
+    return MLX_CATALOG if fmt == FMT_MLX else CATALOG
