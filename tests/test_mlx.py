@@ -112,7 +112,13 @@ def test_mlx_pipeline_plan_and_checks(jp_dir: Path, monkeypatch):
     assert steps[0].kind == "mlx_convert"
     assert "-m" in steps[0].cmd and "mlx_lm" in steps[0].cmd and "convert" in steps[0].cmd
     assert "--q-bits" in steps[0].cmd and "4" in steps[0].cmd
+    assert steps[0].expected_bytes > 0
     assert "--dtype" in steps[2].cmd and "bfloat16" in steps[2].cmd
+
+    from llmquant.pipeline import parse_progress
+
+    assert parse_progress("mlx_convert", "[INFO] Loading") == 0.05
+    assert parse_progress("mlx_convert", "[INFO] Quantizing") == 0.12
 
     # Existing output dir blocks without overwrite
     (out_dir / output_mlx_dirname(b.stem, "MLX-4bit")).mkdir()

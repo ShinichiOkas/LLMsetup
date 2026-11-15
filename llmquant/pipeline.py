@@ -58,13 +58,14 @@ class JobSpec:
 @dataclass
 class Step:
     title: str
-    kind: str  # "convert" | "quantize" | "move" | "verify" | "ollama"
+    kind: str  # "convert" | "quantize" | "mlx_convert" | "move" | "verify" | "ollama"
     cmd: list[str] | None = None
     action: Callable[["Runner"], None] | None = None
     partial: Path | None = None  # file written by this step under a temp name
     final: Path | None = None  # name the partial is renamed to on success
     weight: float = 1.0  # relative duration, for the overall progress bar
     temporary: bool = False  # final is an intermediate: delete it if the job fails
+    expected_bytes: int = 0  # optional target size for directory/file progress estimation
 
 
 @dataclass
@@ -290,9 +291,12 @@ def _plan_mlx_steps(spec: JobSpec) -> list[Step]:
             cmd += ["--dtype", q.mlx_dtype]
         else:
             cmd += ["-q", "--q-bits", str(q.mlx_bits), "--q-group-size", str(q.mlx_group_size), "--q-mode", q.mlx_mode]
+        from .options import estimate_bytes
+
         steps.append(Step(
             f"MLX 変換・量子化: {q.name}", "mlx_convert",
             cmd=cmd, partial=part, final=final, weight=1.5 * gb,
+            expected_bytes=estimate_bytes(base, q),
         ))
         steps.append(Step(
             f"確認: {q.name} の MLX 出力を確かめる", "verify",
@@ -393,6 +397,14 @@ def parse_progress(kind: str, line: str) -> float | None:
         m = _PERCENT.search(line)
         if m:
             return min(int(m.group(1)), 100) / 100
+    if kind == "mlx_convert":
+        low = line.lower()
+        if "[info] loading" in low:
+            return 0.05
+        if "[info] using dtype" in low:
+            return 0.08
+        if "[info] quantizing" in low or "[info] dequantizing" in low:
+            return 0.12
     return None
 
 
@@ -476,9 +488,10 @@ class Runner:
         return self.result
 
     # -- helpers
-    def _report(self, frac: float, step: Step) -> None:
+    def _report(self, frac: float, step: Step, detail: str | None = None) -> None:
         overall = (self._done + step.weight * frac) / self._total
-        self.on_progress(min(overall, 1.0), self._idx, step.title)
+        title = f"{step.title}（{detail}）" if detail else step.title
+        self.on_progress(min(overall, 1.0), self._idx, title)
 
     def _cleanup(self) -> None:
         for s in self.steps:
@@ -501,6 +514,7 @@ class Runner:
         env = dict(os.environ)
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUTF8"] = "1"
+        env["PYTHONUNBUFFERED"] = "1"
         return env
 
     def capture(self, cmd: list[str]) -> str:
@@ -519,33 +533,79 @@ class Runner:
             )
         proc = self._proc
         assert proc.stdout is not None
+
+        stop_watch = threading.Event()
+        watch_thread: threading.Thread | None = None
+        if kind == "mlx_convert" and step and step.partial:
+            watch_dir = step.partial
+            expected = max(step.expected_bytes, 1)
+
+            def _watch_mlx_dir() -> None:
+                last_bytes = -1
+                last_log_t = 0.0
+                last_file = ""
+                while not stop_watch.wait(0.5):
+                    if self.cancelled:
+                        break
+                    if not watch_dir.is_dir():
+                        continue
+                    try:
+                        files = [f for f in watch_dir.iterdir() if f.is_file()]
+                        total_sz = sum(f.stat().st_size for f in files)
+                        st_files = sorted(f.name for f in files if f.suffix == ".safetensors")
+                        cur_name = st_files[-1] if st_files else ""
+                    except OSError:
+                        continue
+                    if total_sz <= 0:
+                        continue
+                    ratio = min(total_sz / expected, 1.0)
+                    frac = 0.12 + 0.86 * ratio
+                    detail = f"{human_bytes(total_sz)} / 約 {human_bytes(expected)}"
+                    if cur_name:
+                        detail = f"{cur_name}: {detail}"
+                    self._report(frac, step, detail=detail)
+                    now = time.monotonic()
+                    if (total_sz != last_bytes and now - last_log_t >= 5.0) or (cur_name and cur_name != last_file):
+                        self.log(f"[進捗] 書き込み中: {detail}")
+                        last_bytes = total_sz
+                        last_log_t = now
+                        last_file = cur_name
+
+            watch_thread = threading.Thread(target=_watch_mlx_dir, daemon=True)
+            watch_thread.start()
+
         buf = b""
         tail: list[str] = []
         last_emit = 0.0
-        while True:
-            chunk = proc.stdout.read1(65536) if hasattr(proc.stdout, "read1") else proc.stdout.read(4096)
-            if not chunk:
-                break
-            buf += chunk
-            parts = re.split(rb"[\r\n]", buf)
-            buf = parts.pop()
-            for raw in parts:
-                line = raw.decode("utf-8", errors="replace").rstrip()
-                if not line:
-                    continue
-                tail = (tail + [line])[-30:]
-                frac = parse_progress(kind, line) if step else None
-                if frac is not None and step:
-                    self._report(frac, step)
-                    # tqdm/quantize lines are many; keep the log readable
-                    now = time.monotonic()
-                    if now - last_emit < 0.5 and kind == "convert":
+        try:
+            while True:
+                chunk = proc.stdout.read1(65536) if hasattr(proc.stdout, "read1") else proc.stdout.read(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                parts = re.split(rb"[\r\n]", buf)
+                buf = parts.pop()
+                for raw in parts:
+                    line = raw.decode("utf-8", errors="replace").rstrip()
+                    if not line:
                         continue
-                    last_emit = now
-                self.log(line)
-        if buf.strip():
-            self.log(buf.decode("utf-8", errors="replace").rstrip())
-        rc = proc.wait()
+                    tail = (tail + [line])[-30:]
+                    frac = parse_progress(kind, line) if step else None
+                    if frac is not None and step:
+                        self._report(frac, step)
+                        # tqdm/quantize lines are many; keep the log readable
+                        now = time.monotonic()
+                        if now - last_emit < 0.5 and kind == "convert":
+                            continue
+                        last_emit = now
+                    self.log(line)
+            if buf.strip():
+                self.log(buf.decode("utf-8", errors="replace").rstrip())
+            rc = proc.wait()
+        finally:
+            stop_watch.set()
+            if watch_thread is not None:
+                watch_thread.join(timeout=1.0)
         with self._lock:
             self._proc = None
         if self.cancelled:
